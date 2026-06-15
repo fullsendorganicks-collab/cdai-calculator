@@ -22,9 +22,37 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("cdai.calculator_leads")
 
-DB_URL = os.getenv("DATABASE_URL")
+DB_URL          = os.getenv("DATABASE_URL")
+BEEHIIV_API_KEY = os.getenv("BEEHIIV_API_KEY")
+BEEHIIV_PUB_ID  = os.getenv("BEEHIIV_PUBLICATION_ID")
 
 router = APIRouter()
+
+
+def _subscribe_beehiiv(email: str) -> None:
+    """Auto-subscribe to Beehiiv on gate unlock. Silent — never blocks the response."""
+    try:
+        if not BEEHIIV_API_KEY or not BEEHIIV_PUB_ID:
+            return
+        import requests as req
+        req.post(
+            f"https://api.beehiiv.com/v2/publications/{BEEHIIV_PUB_ID}/subscriptions",
+            headers={
+                "Authorization": f"Bearer {BEEHIIV_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "email": email,
+                "reactivate_existing": True,
+                "send_welcome_email": True,
+                "utm_source": "distortion-calculator",
+                "utm_medium": "website",
+            },
+            timeout=5,
+        )
+        logger.info(f"[CALC] Beehiiv subscribed: {email}")
+    except Exception as e:
+        logger.error(f"[CALC] Beehiiv subscribe failed for {email}: {e}")
 
 
 def get_conn():
@@ -296,6 +324,7 @@ def create_calculator_lead(payload: CalcLeadCreate):
         ))
         conn.commit()
         logger.info(f"[CALC] New lead: {payload.email} / {payload.company}")
+        _subscribe_beehiiv(payload.email.strip().lower())
         return {"id": lead_id}
     except Exception as e:
         conn.rollback()
