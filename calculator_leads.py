@@ -362,11 +362,15 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate):
 
         r = payload.results or {}
         i = payload.inputs or {}
+        # Gate the pitch email behind realistic campaign minimums.
+        # $500+ spend, 10+ leads, $5+ true CPL, and a measurable gap
+        # filters bots, test entries, and people who tab through with garbage numbers.
         should_email = (
             not row["email_sent"]
-            and r.get("trueCpl", 0) > 0
-            and i.get("adSpend", 0) > 0
-            and i.get("leads", 0) > 0
+            and i.get("adSpend", 0) >= 500
+            and i.get("leads", 0) >= 10
+            and r.get("trueCpl", 0) >= 5.0
+            and abs(r.get("cplGapPct", 0)) >= 1.0
         )
 
         if should_email:
