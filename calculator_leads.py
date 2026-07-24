@@ -1,12 +1,14 @@
 """
 Calculator Leads — Distortion Calculator lead capture endpoints.
 
+POST  /calculator-view              Anonymous funnel-entry ping. No PII.
 POST  /calculator-send-code        Send 6-digit OTP to email. First gate step.
 POST  /calculator-lead             Verify OTP, create row, subscribe Beehiiv. Returns {id}.
 PATCH /calculator-lead/{lead_id}   Live save. Sends results email once when data is real.
 
-Completely isolated — reads/writes only calculator_leads and calculator_otps tables.
-No access to any engine tables (orgs, lead_events, cost_events, etc).
+Completely isolated — reads/writes only calculator_leads, calculator_otps,
+and calculator_views tables. No access to any engine tables (orgs,
+lead_events, cost_events, etc).
 """
 
 import os
@@ -35,7 +37,29 @@ def get_conn():
     return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
 
 
+_VIEWS_TABLE_READY = False
+
+
+def _ensure_views_table(cur) -> None:
+    """Idempotent — creates calculator_views on first call if missing."""
+    global _VIEWS_TABLE_READY
+    if _VIEWS_TABLE_READY:
+        return
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS calculator_views (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            session_id TEXT,
+            viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    _VIEWS_TABLE_READY = True
+
+
 # ── Pydantic models ──────────────────────────────────────────────────────────
+
+class ViewPing(BaseModel):
+    session_id: Optional[str] = None
+
 
 class SendCodeRequest(BaseModel):
     name: str
@@ -292,6 +316,33 @@ def send_results_email(name: str, company: str, email: str,
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@router.post("/calculator-view")
+def log_view(payload: ViewPing):
+    """
+    Anonymous funnel-entry ping — fired once when the calculator panel
+    scrolls into view, before any name/company/email is entered. No PII.
+    Lets us measure viewed -> started (OTP requested) -> verified (lead)
+    instead of only ever seeing the last stage.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        _ensure_views_table(cur)
+        cur.execute(
+            "INSERT INTO calculator_views (session_id) VALUES (%s)",
+            (payload.session_id,)
+        )
+        conn.commit()
+        return {"status": "ok"}
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"[CALC] Failed to log view: {e}")
+        # Never let tracking failure surface to the visitor.
+        return {"status": "ok"}
+    finally:
+        conn.close()
+
+
 @router.post("/calculator-send-code")
 def send_code(payload: SendCodeRequest):
     """
@@ -310,11 +361,11 @@ def send_code(payload: SendCodeRequest):
     conn = get_conn()
     cur  = conn.cursor()
     try:
-        # Clean up any old unverified codes for this email
-        cur.execute(
-            "DELETE FROM calculator_otps WHERE email = %s AND verified = FALSE",
-            (email,)
-        )
+        # Note: previously this deleted prior unverified codes for this email
+        # before inserting the new one. That silently destroyed the only
+        # record that a funnel-abandon (requested code, never verified) ever
+        # happened. Old unverified rows are now kept — they're cheap, and
+        # expires_at already lets us tell "abandoned" from "still active".
         cur.execute("""
             INSERT INTO calculator_otps (email, name, company, code, expires_at)
             VALUES (%s, %s, %s, %s, NOW() + INTERVAL '10 minutes')
