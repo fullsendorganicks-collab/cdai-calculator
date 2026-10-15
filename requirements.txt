@@ -3,3 +3,4 @@ uvicorn
 psycopg2-binary
 resend
 python-dotenv
+limits==5.8.0
