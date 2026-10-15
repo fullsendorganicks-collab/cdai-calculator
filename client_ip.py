@@ -31,5 +31,7 @@ def ip_bucket(ip: str) -> str:
     except ValueError:
         return ip
     if a.version == 6:
+        if a.ipv4_mapped is not None:       # ::ffff:1.2.3.4 is the IPv4 caller 1.2.3.4 seen through a dual-stack socket: it must not collapse into ::/64 with everyone else
+            return str(a.ipv4_mapped)
         return str(ipaddress.ip_network(f"{a}/64", strict=False))
     return ip

@@ -350,6 +350,32 @@ check(client_ip.real_client_ip(R(None)) == "10.0.0.1" and client_ip.real_client_
 check(client_ip.real_client_ip(R(" , ,")) == "10.0.0.1", "an empty header falls back")
 check(client_ip.ip_bucket("2001:db8:1:2:aaaa:bbbb:cccc:dddd") == "2001:db8:1:2::/64" and client_ip.ip_bucket("1.2.3.4") == "1.2.3.4" and client_ip.ip_bucket("junk") == "junk", "IPv6 -> /64, IPv4 and junk unchanged")
 
+print("-- 15b. review round 1 fixes: mapped IPv6, apostrophe and new-TLD addresses, one mailbox = one per-address bucket")
+check(client_ip.ip_bucket("::ffff:1.2.3.4") == "1.2.3.4" and client_ip.ip_bucket("::ffff:5.6.7.8") != client_ip.ip_bucket("::ffff:1.2.3.4"), "an IPv4-mapped IPv6 address is bucketed as its IPv4 address (not one shared ::/64 bucket)")
+check(client_ip.ip_bucket("2001:db8::1") == "2001:db8::/64", "a real IPv6 address still reduces to its /64")
+ok_addrs = ["o'brien@example.com", "first.last+tag@example.co.uk", "u@example.xn--p1ai", "a_b-c@sub.example.org"]
+bad_addrs = ["a b@example.com", "a@example", "a@example.1", "<a>@example.com", "a@@example.com", "a@exa mple.com", 'a"b@example.com', "a@example.c", "a,b@example.com", ("x" * 250) + "@example.com"]
+check(all(bool(cl._EMAIL_RE.fullmatch(x)) for x in ok_addrs), "accepted: apostrophe, plus tag, long and punycode TLD, underscore/hyphen")
+check(not any(cl._EMAIL_RE.fullmatch(x) and len(x) <= cl.EMAIL_MAX for x in bad_addrs), "still refused: spaces, no dot, numeric TLD, angle brackets, double @, quotes, commas, over 254")
+check(send_code("o'brien@example.com", addr=ip()).status_code == 200, "an address with an apostrophe can request a code")
+check(cl._cap_key("a.b+x@gmail.com") == "ab@gmail.com" and cl._cap_key("ab@googlemail.com") == "ab@gmail.com" and cl._cap_key("a.b+x@corp.com") == "a.b@corp.com" and cl._cap_key("plain@example.com") == "plain@example.com", "cap key: +tag dropped everywhere, dots dropped and googlemail=gmail for Google only")
+reset()
+variants = ["bomb@gmail.com", "b.omb@gmail.com", "bomb+one@gmail.com", "b.o.m.b+two@googlemail.com"]
+codes = [send_code(v, addr=ip()).status_code for v in variants]
+check(codes == [200, 200, 200, 429], f"four spellings of one Gmail mailbox share ONE 3-per-hour bucket (got {codes})")
+reset()
+codes = [send_code(v, addr=ip()).status_code for v in ["corp@example.com", "corp+a@example.com", "corp+b@example.com", "corp+c@example.com"]]
+check(codes == [200, 200, 200, 429], f"+tags share one bucket at any provider (got {codes})")
+check(send_code("co.rp@example.com", addr=ip()).status_code == 200, "dots are significant outside Google: co.rp@ is a different mailbox with its own bucket")
+reset(); e1, e2 = "ver.ify@gmail.com", "verify+z@gmail.com"
+send_code(e1, addr=ip()); good = last_code(e1)
+res = [verify(e1 if i % 2 == 0 else e2, "000000", addr=ip()).status_code for i in range(7)]
+check(res[:6] == [400] * 6 and res[6] == 429, f"verify attempts across spellings of one mailbox share the 6-per-10-min bucket (got {res})")
+reset(); lead_a = new_lead("mail.box@gmail.com"); lead_b = new_lead("mailbox+r@gmail.com"); lead_c = new_lead("mailbox@gmail.com"); lead_d = new_lead("m.ailbox@gmail.com")
+for L in (lead_a, lead_b, lead_c): patch(L, addr=ip())
+before = len(SENT); patch(lead_d, addr=ip())
+check(before == 3 and len(SENT) == 3 and email_sent_flag(lead_d) is False, "results emails: four leads for one Gmail mailbox share the 3-per-day cap (the 4th is saved but not mailed)")
+
 print("-- 16. the configured limits (amount per window)")
 table = {"SEND_CODE_PER_IP": (5, 3600), "SEND_CODE_PER_EMAIL": (3, 3600), "VERIFY_PER_IP": (20, 600), "VERIFY_PER_EMAIL": (6, 600),
          "VIEW_PER_IP": (60, 60), "UPDATE_PER_IP": (120, 60), "RESULTS_EMAIL_PER_ADDRESS": (3, 86400)}

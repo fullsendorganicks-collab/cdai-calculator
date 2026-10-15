@@ -43,7 +43,7 @@ router = APIRouter()
 NAME_MAX, COMPANY_MAX, EMAIL_MAX, SESSION_ID_MAX, JSON_MAX_CHARS = 100, 200, 254, 100, 20000
 SUBJECT_MAX = 200
 TOO_MANY_DETAIL = "Too many requests. Please try again later."
-_EMAIL_RE = re.compile(r"[^@\s<>\"',;()\[\]\\\x00-\x1f\x7f]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}")
+_EMAIL_RE = re.compile(r"[^@\s<>\",;()\[\]\\\x00-\x1f\x7f]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z][A-Za-z0-9-]{1,}")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _CODE_RE = re.compile(r"[0-9]{6}")
 
@@ -71,6 +71,20 @@ def _clean_email(raw: str) -> str:
     if len(v) > EMAIL_MAX or not _EMAIL_RE.fullmatch(v):
         raise HTTPException(status_code=400, detail="Valid email required")
     return v
+
+
+_GOOGLE_DOMAINS = ("gmail.com", "googlemail.com")
+
+
+def _cap_key(email: str) -> str:
+    """The mailbox an address really delivers to, used ONLY as the per-address rate-limit key (the stored address and the code lookup stay exact).
+    `+tag` is dropped (every provider delivers a+x@d to a@d); dots are dropped and googlemail.com is read as gmail.com for Google addresses only (dots
+    mean something at other providers). Without this, one mailbox has unlimited per-address buckets (a+1@, a+2@, a.b@, ...) and could be mail-bombed."""
+    local, _, domain = email.rpartition("@")
+    local = local.split("+", 1)[0]
+    if domain in _GOOGLE_DOMAINS:
+        local, domain = local.replace(".", ""), "gmail.com"
+    return f"{local}@{domain}"
 
 
 def _clean_text(raw: str, max_len: int, label: str) -> str:
@@ -422,7 +436,7 @@ def send_code(payload: SendCodeRequest,
     name    = _clean_text(payload.name, NAME_MAX, "Name")
     company = _clean_text(payload.company, COMPANY_MAX, "Company")
 
-    if not rate_limits.allow(rate_limits.SEND_CODE_PER_EMAIL, email, "calc_code_email"):
+    if not rate_limits.allow(rate_limits.SEND_CODE_PER_EMAIL, _cap_key(email), "calc_code_email"):
         raise _too_many()
 
     code = f"{secrets.randbelow(10**6):06d}"
@@ -468,7 +482,7 @@ def create_calculator_lead(payload: CalcLeadCreate,
     _check_json_size(payload.inputs, "inputs")
     _check_json_size(payload.results, "results")
 
-    if not rate_limits.allow(rate_limits.VERIFY_PER_EMAIL, email, "calc_verify_email"):
+    if not rate_limits.allow(rate_limits.VERIFY_PER_EMAIL, _cap_key(email), "calc_verify_email"):
         raise _too_many()
 
     code = (payload.code or "").strip()
@@ -582,7 +596,7 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
 
         if should_email and rate_limits.allow(
                 rate_limits.RESULTS_EMAIL_PER_ADDRESS,
-                str(row["email"]).strip().lower(), "calc_results_email"):
+                _cap_key(str(row["email"]).strip().lower()), "calc_results_email"):
             sent = send_results_email(
                 row["name"], row["company"], row["email"], r, i
             )
