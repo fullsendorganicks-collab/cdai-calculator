@@ -407,35 +407,54 @@ table = {"SEND_CODE_PER_IP": (5, 3600), "VERIFY_PER_IP": (20, 600), "VIEW_PER_IP
 for k, (amt, win) in table.items():
     lim = getattr(rl, k); check((lim.amount, lim.get_expiry()) == (amt, win), f"in-memory {k} = {amt} per {win} s")
 check(not any(hasattr(rl, k) for k in ("SEND_CODE_PER_EMAIL", "VERIFY_PER_EMAIL", "RESULTS_EMAIL_PER_ADDRESS")), "the in-memory per-mailbox limits are gone (no dead code)")
-dtable = {"SEND_CODE_PER_MAILBOX": ("code_mailbox", 3, 3600), "SEND_CODE_GLOBAL": ("global_code", 100, 3600), "VERIFY_PER_MAILBOX": ("verify_mailbox", 6, 600), "RESULTS_PER_MAILBOX": ("results_mailbox", 3, 86400)}
+dtable = {"SEND_CODE_PER_MAILBOX": ("code_mailbox", 3, 3600), "SEND_CODE_GLOBAL": ("global_code", 100, 3600), "VERIFY_PER_MAILBOX": ("verify_mailbox", 6, 600), "VERIFY_GLOBAL": ("global_verify", 300, 3600), "RESULTS_PER_MAILBOX": ("results_mailbox", 3, 86400), "RESULTS_CLAIM": ("results_claim", 1, 3600)}
 for k, v in dtable.items(): check(tuple(getattr(dl, k)) == v, f"durable {k} = {v[1]} per {v[2]} s")
 check(dl.GLOBAL_KEY == "*" and dl.PURGE_AFTER == "2 days" and dl.PURGE_EVERY_CALLS == 100, "global key '*', purge after 2 days, every 100 calls")
 check((cl.NAME_MAX, cl.COMPANY_MAX, cl.EMAIL_MAX, cl.SESSION_ID_MAX, cl.JSON_MAX_CHARS, cl.SUBJECT_MAX) == (100, 200, 254, 100, 20000, 200), "size limits are 100/200/254/100/20000/200")
 check(cl.TOO_MANY_DETAIL == GENERIC, "the one refusal text")
 
-print("-- 18. client address: a public socket address wins and X-Forwarded-For is ignored")
+print("-- 18. client address: the LAST raw X-Forwarded-For hop, proven through uvicorn's real proxy-header middleware")
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 class R2:
     def __init__(self, host, xff=None):
         self.headers = {"x-forwarded-for": xff} if xff else {}
         self.client = type("C", (), {"host": host})() if host else None
 rip = client_ip.real_client_ip
-check(rip(R2("8.8.8.8", "1.2.3.4, 5.6.7.8")) == "8.8.8.8", "public host: forged X-Forwarded-For changes nothing")
-check(rip(R2("8.8.8.8", "9.9.9.9")) == "8.8.8.8" and rip(R2("8.8.8.8")) == "8.8.8.8", "public host with or without the header")
-check(rip(R2("::ffff:8.8.8.8", "1.1.1.1")) == "8.8.8.8", "IPv4-mapped public host is the IPv4 address")
-check(rip(R2("2606:4700::1111", "1.1.1.1")) == "2606:4700::1111", "public IPv6 host used as is")
-for h in ("10.1.2.3", "172.16.0.9", "192.168.1.1", "127.0.0.1", "169.254.1.1", "0.0.0.0", "100.64.0.5", "::1", "fe80::1", "testclient"):
-    check(rip(R2(h, "7.7.7.7, 3.3.3.3")) == "3.3.3.3", f"non-public host {h}: last X-Forwarded-For hop is used")
-check(rip(R2("10.0.0.1", "3.3.3.3, not-an-ip")) == "10.0.0.1", "non-public host and a garbage last hop: falls back to the host")
-check(rip(R2(None, "garbage")) == "unknown" and rip(R2(None, "4.4.4.4")) == "4.4.4.4", "no host: 'unknown' for garbage, the hop when it parses")
-check(rip(R2("10.0.0.1")) == "10.0.0.1", "non-public host and no header: the host")
-pub = TestClient(app, client=("8.8.4.4", 5000)); pub2 = TestClient(app, client=("9.9.9.9", 5000))
+check(rip(R2("8.8.8.8", "1.2.3.4, 5.6.7.8")) == "5.6.7.8", "the socket address is NOT trusted: the last forwarded hop wins even over a public host")
+check(rip(R2("5.5.5.5", "1.1.1.1, 9.9.9.9")) == "9.9.9.9", "forged first entry ignored, last hop used")
+check(rip(R2("10.0.0.1", "9.9.9.9")) == "9.9.9.9" and rip(R2(None, "4.4.4.4")) == "4.4.4.4", "single hop used")
+check(rip(R2("10.0.0.1", "3.3.3.3, not-an-ip")) == "10.0.0.1", "unparseable last hop: falls back to the host")
+check(rip(R2("10.0.0.1", " , ,")) == "10.0.0.1" and rip(R2("10.0.0.1")) == "10.0.0.1", "empty or absent header: falls back to the host")
+check(rip(R2(None, "garbage")) == "unknown" and rip(R2(None)) == "unknown", "no host and no usable header: 'unknown'")
+check(rip(R2("10.0.0.1", "2606:4700::1111")) == "2606:4700::1111", "IPv6 last hop accepted")
+for label, wrapped, cli in (("trusted_hosts='*'", ProxyHeadersMiddleware(app, trusted_hosts="*"), ("203.0.113.9", 4000)),
+                            ("trusted_hosts='127.0.0.1'", ProxyHeadersMiddleware(app, trusted_hosts="127.0.0.1"), ("127.0.0.1", 4000))):
+    c1 = TestClient(wrapped, client=cli)
+    reset()
+    codes = [c1.post("/calculator-send-code", json={"name": "A", "company": "B", "email": f"ph{i}@example.com"}, headers={"X-Forwarded-For": f"1.1.1.{i}, 9.9.9.9"}).status_code for i in range(6)]
+    check(codes == [200] * 5 + [429], f"{label}: rotating the forged FIRST entry cannot defeat the per-IP cap (got {codes})")
+    check(c1.post("/calculator-send-code", json={"name": "A", "company": "B", "email": "ph99@example.com"}, headers={"X-Forwarded-For": "9.9.9.9"}).status_code == 429, f"{label}: the cap is counting 9.9.9.9")
+    check(c1.post("/calculator-send-code", json={"name": "A", "company": "B", "email": "ph98@example.com"}, headers={"X-Forwarded-For": "1.1.1.1, 7.7.7.7"}).status_code == 200, f"{label}: 1.1.1.1 was never the counted address")
+    reset(); v0 = n("calculator_views")
+    for i in range(61): c1.post("/calculator-view", json={"session_id": "s"}, headers={"X-Forwarded-For": f"2.2.2.{i}, 6.6.6.6"})
+    check(n("calculator_views") - v0 == 60, f"{label}: view cap counts the last hop, not the rotating first entry")
+seen_client = []
+async def spy(scope, receive, send): seen_client.append(scope["client"][0]); await app(scope, receive, send)
+TestClient(ProxyHeadersMiddleware(spy, trusted_hosts="*"), client=("203.0.113.9", 4000)).get("/health", headers={"X-Forwarded-For": "1.1.1.1, 9.9.9.9"})
+check(seen_client == ["1.1.1.1"], "premise confirmed: uvicorn's middleware rewrites scope client to the FIRST (forgeable) entry, so client.host cannot be trusted")
 reset()
-codes = [pub.post("/calculator-send-code", json={"name": "A", "company": "B", "email": f"pc{i}@example.com"}, headers={"X-Forwarded-For": f"1.1.1.{i}"}).status_code for i in range(6)]
-check(codes == [200] * 5 + [429], f"end to end: six forged-header requests from one public socket address share one bucket (got {codes})")
-check(pub2.post("/calculator-send-code", json={"name": "A", "company": "B", "email": "pc9@example.com"}, headers={"X-Forwarded-For": "1.1.1.1"}).status_code == 200, "a different socket address is a different bucket whatever the header claims")
-reset(); v0 = n("calculator_views")
-for i in range(61): pub.post("/calculator-view", json={"session_id": "s"}, headers={"X-Forwarded-For": f"2.2.2.{i}"})
-check(n("calculator_views") - v0 == 60, "view cap also keyed by the socket address, not the header")
+class Cap2(logging.Handler):
+    def __init__(self): super().__init__(); self.t = []
+    def emit(self, rec): self.t.append(rec.getMessage())
+c2 = Cap2(); logging.getLogger("cdai.calculator_leads").addHandler(c2)
+client_ip._warned = False
+rip(R2("10.0.0.1", "8.8.8.8")); n_pub = len(c2.t)
+rip(R2("10.0.0.1", "10.1.1.1")); rip(R2("10.0.0.1", "10.2.2.2")); rip(R2(None))
+warn = [t for t in c2.t if "rate-limit bucket" in t]
+check(n_pub == 0 and len(warn) == 1, f"a public caller logs nothing; a non-public/unknown one logs ONE warning per process (got {len(warn)})")
+check(warn and not re.search(r"\d+\.\d+\.\d+\.\d+", warn[0]), "the warning names no address")
+client_ip._warned = False; c2.t.clear(); rip(R2(None)); check(len([t for t in c2.t if "rate-limit bucket" in t]) == 1 and "'unknown'" in c2.t[-1], "'unknown' is reported as such")
+logging.getLogger("cdai.calculator_leads").removeHandler(c2)
 
 print("-- 19. durable store: contract")
 reset()
@@ -535,6 +554,7 @@ for age, label in ((3600, "1h"), (86400, "1d"), (172000, "1.99d"), (173000, "2.0
 check(dl.purge() == 2 and sorted(x[0] for x in db("SELECT key FROM calculator_rate_events WHERE bucket='purge'")) == ["1.99d", "1d", "1h"], "purge removes only rows older than 2 days")
 db("INSERT INTO calculator_rate_events (bucket, key, at) VALUES ('purge', 'old', now() - interval '5 days')")
 dl._calls = dl.PURGE_EVERY_CALLS - 1; dl.allow("p2", "k", 5, 60)
+if dl._purge_thread: dl._purge_thread.join(30)
 check(db("SELECT count(*) FROM calculator_rate_events WHERE key='old'")[0][0] == 0 and events("purge") == 3, "the 100th call purges opportunistically and keeps recent rows")
 dl._calls = 0; db("INSERT INTO calculator_rate_events (bucket, key, at) VALUES ('purge', 'old2', now() - interval '5 days')"); dl.allow("p2", "k", 5, 60)
 check(db("SELECT count(*) FROM calculator_rate_events WHERE key='old2'")[0][0] == 1, "ordinary calls do not purge")
@@ -573,9 +593,8 @@ reset(); send_code("vburst@example.com", addr=ip()); good = last_code("vburst@ex
 res = burst(20, lambda c, i: c.post("/calculator-lead", json={"name": "A", "company": "B", "email": "vburst@example.com", "code": wrong}, headers=hdr(i)).status_code)
 slow_off()
 check(res.count(400) == 6 and res.count(429) == 14, f"20 concurrent verify attempts: exactly 6 reach the code lookup (got {res.count(400)} / {res.count(429)})")
-reset(); o0 = n("calculator_otps"); slow_on()
+reset(); o0 = n("calculator_otps")      # no artificial pause here: lock_timeout (2 s) is a real bound, 100 serialised holds must fit in it
 res = burst(120, lambda c, i: c.post("/calculator-send-code", json={"name": "A", "company": "B", "email": f"gb{i}@example.com"}, headers=hdr(i)).status_code)
-slow_off()
 check(res.count(200) == 100 and res.count(429) == 20, f"120 concurrent requests: exactly 100 allowed by the global ceiling (got {res.count(200)} / {res.count(429)})")
 check(n("calculator_otps") - o0 == 100 and len(SENT) == 100 and events("global_code") == 100, "exactly 100 OTP rows, mails and recorded hits")
 reset(); lead = new_lead("race@example.com")
@@ -710,6 +729,197 @@ st = drive(reader_app, [], [], scope_type="lifespan")
 check(st["called"], "non-HTTP scopes pass straight through")
 st = drive(reader_app, [(b"content-length", b"70000")], [], scope_type="websocket")
 check(st["called"] and st["status"] != 413, "a non-HTTP scope is never answered with an HTTP 413, whatever headers it carries")
+
+print("-- 28. exactly-once results mail: durable per-lead mutex, email_sent only after a real send")
+def kill_backends():
+    db("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()")
+reset(); lead = new_lead("mx1@example.com"); resend.Emails.send = failing_send
+check(patch(lead, addr=ip()).status_code == 200 and email_sent_flag(lead) is False, "send fails: 200, email_sent stays FALSE")
+check(events("results_claim") == 0 and events("results_mailbox") == 0, "send fails: the claim and the mailbox hit are both refunded")
+resend.Emails.send = _record; SENT.clear(); patch(lead, addr=ip())
+check(len(SENT) == 1 and email_sent_flag(lead) is True and events("results_claim") == 1, "a retry sends; the claim row stays as the mutex")
+reset(); lead = new_lead("mx2@example.com")
+def kill_then_fail(params): kill_backends(); raise RuntimeError("boom")
+resend.Emails.send = kill_then_fail
+r = patch(lead, addr=ip())
+check(r.status_code == 200 and email_sent_flag(lead) is False and events("results_claim") == 0 and events("results_mailbox") == 0, "connection dropped during a failed send: 200, no stuck TRUE, claim and mailbox hit refunded on fresh connections")
+resend.Emails.send = _record; SENT.clear(); patch(lead, addr=ip())
+check(len(SENT) == 1 and email_sent_flag(lead) is True, "and a later save delivers")
+reset(); lead = new_lead("mx3@example.com"); SENT.clear()
+def kill_then_ok(params): kill_backends(); SENT.append(params); return {"id": "x"}
+resend.Emails.send = kill_then_ok
+patch(lead, addr=ip()); resend.Emails.send = _record
+check(len(SENT) == 1 and email_sent_flag(lead) is True, "connection dropped after a successful send: email_sent is still set (fresh connection)")
+reset(); lead = new_lead("mx4@example.com"); SENT.clear(); n_conn = [0]; real_get = cl.get_conn
+def flaky_conn():
+    n_conn[0] += 1
+    if n_conn[0] in (2, 3): raise psycopg2.OperationalError("down")
+    return real_get()
+cl.get_conn = flaky_conn; patch(lead, addr=ip()); cl.get_conn = real_get
+check(len(SENT) == 1 and email_sent_flag(lead) is True and n_conn[0] == 4, f"marking sent is retried on fresh connections (took {n_conn[0] - 1} tries)")
+reset(); lead = new_lead("mx5@example.com"); SENT.clear(); n_conn = [0]
+def dead_conn():
+    n_conn[0] += 1
+    if n_conn[0] >= 2: raise psycopg2.OperationalError("down")
+    return real_get()
+cl.get_conn = dead_conn; patch(lead, addr=ip()); cl.get_conn = real_get
+check(len(SENT) == 1 and email_sent_flag(lead) is False and n_conn[0] == 4, "marking sent gives up after exactly 3 tries")
+patch(lead, addr=ip()); check(len(SENT) == 1, "the unexpired claim still blocks a second mail")
+backdate("results_claim", 3601); patch(lead, addr=ip())
+check(len(SENT) == 2 and email_sent_flag(lead) is True, "after the mutex expires the unmarked lead is mailed and marked (the one accepted duplicate: three database failures in a row right after a send)")
+reset(); lead = new_lead("mx6@example.com"); SENT.clear()
+dl.hit(dl.RESULTS_CLAIM, lead)                                  # a process died after claiming, before sending
+patch(lead, addr=ip()); check(not SENT and email_sent_flag(lead) is False, "process-death simulation: the orphan claim blocks within the hour")
+backdate("results_claim", 3595); patch(lead, addr=ip()); check(not SENT, "still blocked 5 s before the hour is up")
+backdate("results_claim", 10); patch(lead, addr=ip()); check(len(SENT) == 1 and email_sent_flag(lead) is True, "allowed after the hour: mailed and marked")
+reset()
+
+print("-- 29. table security posture (RLS on, nothing for the PostgREST roles) and self-healing DDL")
+reset(); dl._ready = False; dl.hit(dl.Cap("t", 1, 60), "k")
+check(db("SELECT relrowsecurity FROM pg_class WHERE relname='calculator_rate_events'") == [(True,)], "row level security is enabled on calculator_rate_events")
+check(db("SELECT count(*) FROM pg_policies WHERE tablename='calculator_rate_events'")[0][0] == 0, "no policies (same as the other calculator tables)")
+seq = db("SELECT pg_get_serial_sequence('calculator_rate_events','id')")[0][0]
+for role in ("anon", "authenticated"):
+    t = db("SELECT " + ", ".join(f"has_table_privilege('{role}', 'calculator_rate_events', '{p}')" for p in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")))[0]
+    check(not any(t) and db(f"SELECT has_sequence_privilege('{role}', '{seq}', 'USAGE'), has_sequence_privilege('{role}', '{seq}', 'SELECT'), has_sequence_privilege('{role}', '{seq}', 'UPDATE')")[0] == (False, False, False), f"{role} holds no privilege on the table or its sequence")
+check(db("SELECT has_table_privilege('anon', 'calculator_leads', 'SELECT')")[0][0] is True, "control: the default grants really are present on a table that was not revoked (the assertion above is not vacuous)")
+reset(); dl.hit(dl.Cap("t", 1, 60), "k")
+db("DROP TABLE calculator_rate_events")
+check(dl.hit(dl.Cap("t", 5, 60), "k") is None, "a dropped table: that call is refused (fail closed)")
+check(dl.hit(dl.Cap("t", 5, 60), "k") is not None and db("SELECT to_regclass('calculator_rate_events')")[0][0] is not None, "the next call re-creates the table (self-heal)")
+db("DROP INDEX calculator_rate_events_at"); dl._ready = False; dl.hit(dl.Cap("t", 5, 60), "k")
+check(db("SELECT count(*) FROM pg_indexes WHERE tablename='calculator_rate_events'")[0][0] == 3, "a missing index is noticed and re-created while the table exists")
+reset()
+
+print("-- 30. a role without CREATE")
+db("DROP ROLE IF EXISTS nocreate")
+db("CREATE ROLE nocreate LOGIN BYPASSRLS"); db("GRANT USAGE ON SCHEMA public TO nocreate")      # BYPASSRLS like the production service role (owner/postgres): RLS is on
+db("DROP TABLE calculator_rate_events")
+real_dsn = os.environ["DATABASE_URL"]; nc_dsn = real_dsn.replace("cdai@", "nocreate@")
+lines30 = []
+class H30(logging.Handler):
+    def emit(self, rec): lines30.append(rec.getMessage())
+h30 = H30(); logging.getLogger("cdai.calculator_leads").addHandler(h30)
+os.environ["DATABASE_URL"] = nc_dsn; dl._ready = False; dl._ddl_failure_logged = False
+res30 = [dl.hit(dl.Cap("t", 5, 60), "k") for _ in range(3)]
+os.environ["DATABASE_URL"] = real_dsn
+check(res30 == [None] * 3, "table absent and not creatable: every call is refused")
+check(len([l for l in lines30 if "cannot prepare" in l]) == 1, f"exactly ONE log line for that, not one per request (got {len([l for l in lines30 if 'cannot prepare' in l])})")
+dl._ready = False; dl.hit(dl.Cap("t", 5, 60), "k")                # the owner creates it (as the service itself would)
+db("GRANT SELECT, INSERT, DELETE ON calculator_rate_events TO nocreate"); db(f"GRANT USAGE ON SEQUENCE {db(chr(83)+'ELECT pg_get_serial_sequence(%s,%s)', ('calculator_rate_events','id'))[0][0]} TO nocreate")
+os.environ["DATABASE_URL"] = nc_dsn; dl._ready = False; dl._ddl_failure_logged = False
+check(dl.hit(dl.Cap("t", 5, 60), "k2") is not None, "table pre-created: the role without CREATE works (no DDL is attempted)")
+os.environ["DATABASE_URL"] = real_dsn; logging.getLogger("cdai.calculator_leads").removeHandler(h30)
+db("REVOKE ALL ON calculator_rate_events FROM nocreate"); db("DROP OWNED BY nocreate"); db("DROP ROLE nocreate")
+dl._ready = False; reset()
+
+print("-- 31. timeouts")
+import psycopg2 as _pg
+seen_kw = []; real_pg_connect = _pg.connect
+def spy_connect(*a, **k): seen_kw.append(k); return real_pg_connect(*a, **k)
+_pg.connect = spy_connect
+dl.connect().close(); cl.get_conn().close()
+_pg.connect = real_pg_connect
+check(len(seen_kw) == 2 and all(k.get("connect_timeout") == 5 for k in seen_kw), "durable_limits.connect and calculator_leads.get_conn both pass connect_timeout=5")
+class Rec:
+    def __init__(self, c, log): self._c, self.log = c, log
+    def execute(self, sql, *a): self.log.append(" ".join(sql.split())); return self._c.execute(sql, *a)
+    def __getattr__(self, n): return getattr(self._c, n)
+class RecConn:
+    def __init__(self, c, log): self._conn, self.log = c, log
+    def cursor(self, *a, **k): return Rec(self._conn.cursor(*a, **k), self.log)
+    def __getattr__(self, n): return getattr(self._conn, n)
+stm = []
+reset(); dl.hit(dl.Cap("t", 5, 60), "warm")       # table check done outside the recording
+dl.connect = lambda: RecConn(_real_dl_connect(), stm)
+h_ = dl.hit(dl.Cap("t", 5, 60), "k"); dl.refund(h_); dl.purge()
+dl.connect = _real_dl_connect
+check(stm[:2] == ["SET LOCAL lock_timeout = '2s'", "SET LOCAL statement_timeout = '5s'"], "allow() sets lock_timeout 2s and statement_timeout 5s before anything else")
+check(sum(1 for q in stm if q == "SET LOCAL lock_timeout = '2s'") == 3 and sum(1 for q in stm if q == "SET LOCAL statement_timeout = '5s'") == 3, "so do refund() and purge()")
+reset(); dl.hit(dl.Cap("t", 5, 60), "warm")
+kk = dl._hash("stuck"); holder = psycopg2.connect(os.environ["DATABASE_URL"]); hc = holder.cursor()
+hc.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("tb:" + kk,))
+rel = threading.Timer(9.0, lambda: (holder.rollback(), holder.close())); rel.start()
+t0 = time.time(); got = dl.allow("tb", "stuck", 5, 60); dt = time.time() - t0
+check(got is None and 1.5 < dt < 4.0, f"a held advisory lock makes allow() refuse after about lock_timeout ({dt:.1f} s), it does not hang")
+rel.join(); check(dl.allow("tb", "stuck", 5, 60) is not None, "and it works again once the lock is released")
+reset()
+
+print("-- 32. service-wide verify ceiling (300 per hour)")
+reset()
+for _ in range(300): dl.hit(dl.VERIFY_GLOBAL, dl.GLOBAL_KEY)
+send_code("vg@example.com", addr=ip())
+r = verify("vg@example.com", "000000", addr=ip())
+check(r.status_code == 429 and r.json() == {"detail": GENERIC}, "ceiling reached: 429 with the generic text")
+check(events("verify_mailbox") == 0, "the visitor's own mailbox hit was refunded")
+backdate("global_verify", 3595); check(verify("vg@example.com", "000000", addr=ip()).status_code == 429, "still refused 5 s before the hour is up")
+backdate("global_verify", 10); check(verify("vg@example.com", "000000", addr=ip()).status_code == 400, "allowed again after the hour")
+reset()
+for _ in range(299): dl.hit(dl.VERIFY_GLOBAL, dl.GLOBAL_KEY)
+check(verify("vg1@example.com", "000000", addr=ip()).status_code == 400 and verify("vg2@example.com", "000000", addr=ip()).status_code == 429, "the 300th verify is allowed, the 301st refused")
+reset()
+res = burst(330, lambda c, i: c.post("/calculator-lead", json={"name": "A", "company": "B", "email": f"vgb{i}@example.com", "code": "000000"}, headers=hdr(i)).status_code)
+check(res.count(400) == 300 and res.count(429) == 30, f"330 concurrent verifies: exactly 300 reach the code lookup (got {res.count(400)} / {res.count(429)})")
+check(events("global_verify") == 300 and events("verify_mailbox") == 300, "durable rows after the burst: 300 global + 300 mailbox (the 30 refused were refunded)")
+reset()
+
+print("-- 33. hostile JSON and identifiers")
+reset(); lead = new_lead("hj@example.com")
+def raw_patch(body, lid=None):
+    return http.patch(f"/calculator-lead/{lid or lead}", content=body, headers={**H(), "Content-Type": "application/json"})
+r = raw_patch('{"inputs":{"k":"x\\u0000y\\ud800z","a\\u0000b":"v","bs":"\\\\u0000","pair":"\\ud83d\\ude00","adSpend":0}}')
+stored = db("SELECT inputs FROM calculator_leads WHERE id=%s", (lead,))[0][0]
+check(r.status_code == 200 and stored["k"] == "xyz" and stored["ab"] == "v", "NUL and lone surrogates are removed from values and keys, the save succeeds")
+check(stored["bs"] == "\\u0000" and stored["pair"] == "\U0001F600", "an escaped backslash before u0000 and a valid surrogate pair are left untouched")
+r = raw_patch('{"inputs":{"k":"' + "\\u0000" * 9000 + '"},"results":{"x":1}}')
+check(r.status_code == 200, f"the 20,000-character cap is measured after sanitising (got {r.status_code})")
+r = raw_patch('{"inputs":{"k":"' + "v" * 20001 + '"}}'); check(r.status_code == 413, "and still enforced for real size")
+send_code("hv@example.com", addr=ip()); good = last_code("hv@example.com")
+r = http.post("/calculator-lead", content='{"name":"A","company":"B","email":"hv@example.com","code":"%s","inputs":{"k":"a\\u0000b\\ud800"}}' % good, headers={**H(), "Content-Type": "application/json"}); check(r.status_code == 200, "verify accepts NUL/surrogate junk in inputs too")
+check(send_code("sur@example.com", name="a\ud800b", addr=ip()).status_code == 400 if False else http.post("/calculator-send-code", content='{"name":"a\\ud800b","company":"c","email":"sur@example.com"}', headers={**H(), "Content-Type": "application/json"}).status_code == 400, "a lone surrogate in a name is a 400, not a 500")
+check(http.post("/calculator-send-code", content='{"name":"n","company":"c","email":"s\\ud800@example.com"}', headers={**H(), "Content-Type": "application/json"}).status_code == 400, "a lone surrogate in an address is a 400")
+check(http.post("/calculator-send-code", content='{"name":"n\\u0000","company":"c","email":"nul@example.com"}', headers={**H(), "Content-Type": "application/json"}).status_code == 400, "NUL in a name is a 400")
+check(http.post("/calculator-view", content='{"session_id":"s\\ud800"}', headers={**H(), "Content-Type": "application/json"}).json() == {"status": "ok"}, "a lone surrogate in a view session_id still answers ok")
+base = lead
+for label, lid in (("urn:uuid form", "urn:uuid:" + base), ("braced", "%7B" + base + "%7D"), ("trailing newline", base + "%0A"), ("32 hex without hyphens", base.replace("-", "")), ("leading space", "%20" + base)):
+    check(raw_patch("{}", lid).status_code == 404, f"lead id as {label}: 404")
+check(raw_patch("{}", base.upper()).status_code == 200, "an upper-case id is the same id")
+reset(); send_code("nv@example.com", addr=ip()); good = last_code("nv@example.com")
+verify("nv@example.com", "12345", addr=ip()); verify("nv@example.com", good, addr=ip(), inputs={"k": "v" * 20001}); verify("nv@example.com", good, addr=ip(), name="n" * 101); verify("not-an-email", good, addr=ip())
+check(events("verify_mailbox") == 0 and events("global_verify") == 0, "requests that fail cheap validation consume no durable verify hit")
+check(verify("nv@example.com", good, addr=ip()).status_code == 200 and events("verify_mailbox") == 1 and events("global_verify") == 1, "a valid attempt consumes exactly one of each")
+reset()
+
+print("-- 34. purge: bounded, single-flight, off the request path")
+reset()
+db("INSERT INTO calculator_rate_events (bucket, key, at) SELECT 'old', g::text, now() - interval '5 days' FROM generate_series(1, 2500) g")
+db("INSERT INTO calculator_rate_events (bucket, key, at) SELECT 'new', g::text, now() - interval '1.9 days' FROM generate_series(1, 50) g")
+dels = []
+class DelRec:
+    def __init__(self, c): self._c = c
+    def execute(self, sql, *a):
+        if sql.lstrip().startswith("DELETE FROM calculator_rate_events WHERE id IN"): dels.append(a)
+        return self._c.execute(sql, *a)
+    def __getattr__(self, n): return getattr(self._c, n)
+class DelConn:
+    def __init__(self, c): self._conn = c
+    def cursor(self, *a, **k): return DelRec(self._conn.cursor(*a, **k))
+    def __getattr__(self, n): return getattr(self._conn, n)
+dl.connect = lambda: DelConn(_real_dl_connect())
+deleted = dl.purge(); dl.connect = _real_dl_connect
+check(deleted == 2500 and len(dels) == 3 and all(a[0][-1] == dl.PURGE_BATCH for a in dels), f"2,500 old rows are removed in {len(dels)} batches of at most {dl.PURGE_BATCH}")
+check(events("new") == 50, "rows inside every window (1.9 days) are never touched")
+db("INSERT INTO calculator_rate_events (bucket, key, at) SELECT 'old', g::text, now() - interval '5 days' FROM generate_series(1, 10) g")
+lock_c = psycopg2.connect(os.environ["DATABASE_URL"]); lc = lock_c.cursor(); lc.execute("SELECT pg_advisory_xact_lock(%s)", (dl._PURGE_LOCK_ID,))
+check(dl.purge() == 0 and events("old") == 10, "single-flight: while another purge holds the lock this one does nothing")
+lock_c.rollback(); lock_c.close()
+check(dl.purge() == 10, "and runs once the lock is free")
+real_purge = dl.purge
+dl.purge = lambda: (time.sleep(1.5), 0)[1]
+dl._calls = dl.PURGE_EVERY_CALLS - 1; t0 = time.time(); dl.allow("lat", "k", 5, 60); dt = time.time() - t0
+check(dt < 1.0, f"a request that triggers the purge does not wait for it ({dt:.2f} s)")
+dl._purge_thread.join(10); dl.purge = real_purge
+reset()
 
 print("-- 17. nothing else moved")
 ops = sorted((p_, m) for p_, d in app.openapi()["paths"].items() for m in d)

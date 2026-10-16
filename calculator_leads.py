@@ -67,10 +67,19 @@ def _single_line(text: str) -> str:
     return _CONTROL_RE.sub(" ", text).strip()
 
 
+def _encodable(v: str) -> bool:
+    """False for text that cannot be stored (a lone surrogate from a JSON \\ud800 escape cannot be encoded as UTF-8: it would be a 500 at insert)."""
+    try:
+        v.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def _clean_email(raw: str) -> str:
     """Normalised (stripped, lower-case) address, or HTTP 400. Conservative: no whitespace, control characters or angle brackets, <= 254 chars."""
     v = (raw or "").strip().lower()
-    if len(v) > EMAIL_MAX or not _EMAIL_RE.fullmatch(v):
+    if len(v) > EMAIL_MAX or not _encodable(v) or not _EMAIL_RE.fullmatch(v):
         raise HTTPException(status_code=400, detail="Valid email required")
     return v
 
@@ -93,18 +102,29 @@ def _clean_text(raw: str, max_len: int, label: str) -> str:
     v = (raw or "").strip()
     if len(v) > max_len:
         raise HTTPException(status_code=400, detail=f"{label} too long")
-    if _CONTROL_RE.search(v):
+    if _CONTROL_RE.search(v) or not _encodable(v):
         raise HTTPException(status_code=400, detail=f"{label} contains invalid characters")
     return v
 
 
+# In JSON text produced with ensure_ascii, jsonb rejects \u0000 and a lone surrogate escape. Pairs are kept, an escaped backslash is consumed first so
+# that "\\\\u0000" (a literal backslash followed by u0000) is left alone.
+_JSON_BAD_ESCAPES = re.compile(
+    r"(\\\\)|(\\u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2})|\\u0000|\\u[dD][89a-fA-F][0-9a-fA-F]{2}")
+
+
+def _strip_bad_escapes(text: str) -> str:
+    return _JSON_BAD_ESCAPES.sub(lambda m: m.group(0) if (m.group(1) or m.group(2)) else "", text)
+
+
 def _json_text(v: Optional[dict], label: str) -> str:
-    """The JSON text to store for inputs/results: size-capped (413), always valid for Postgres jsonb. Non-finite numbers (NaN, Infinity), which
-    Python accepts from a client but jsonb rejects, are stored as null. Unserialisable or pathologically nested values are 400."""
+    """The JSON text to store for inputs/results: always valid for Postgres jsonb, size-capped (413) AFTER sanitising. NUL characters and lone
+    surrogates (in strings and keys) are removed; non-finite numbers (NaN, Infinity), which Python accepts from a client but jsonb rejects, become
+    null. Unserialisable or pathologically nested values are 400."""
     if not v:
         return "{}"
     try:
-        text = json.dumps(json.loads(json.dumps(v), parse_constant=lambda _c: None))
+        text = json.dumps(json.loads(_strip_bad_escapes(json.dumps(v)), parse_constant=lambda _c: None))
     except (TypeError, ValueError, RecursionError):
         raise HTTPException(status_code=400, detail=f"{label} not valid")
     if len(text) > JSON_MAX_CHARS:
@@ -124,7 +144,7 @@ def _num(v) -> float:
 
 
 def get_conn():
-    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor, connect_timeout=5)
 
 
 _VIEWS_TABLE_READY = False
@@ -529,14 +549,19 @@ def create_calculator_lead(payload: CalcLeadCreate,
     inputs_json  = _json_text(payload.inputs, "inputs")
     results_json = _json_text(payload.results, "results")
 
-    # Consumed on every attempt, right or wrong code, BEFORE the code lookup; durable, so a restart or a second worker cannot reset the guess budget.
-    if durable_limits.hit(durable_limits.VERIFY_PER_MAILBOX, _cap_key(email)) is None:
-        raise _too_many()
-
     code = (payload.code or "").strip()
     if not _CODE_RE.fullmatch(code):
-        # Codes are always 6 ASCII digits; anything else can never match, so skip the database.
+        # Codes are always 6 ASCII digits; anything else can never match, so it neither costs a guess nor touches the database.
         raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    # Everything cheap and stateless is validated above. From here every attempt, right or wrong code, is consumed BEFORE the code lookup; durable, so a
+    # restart or a second worker cannot reset the guess budget. The service-wide verify ceiling bounds durable writes whatever the number of IPs.
+    h_mailbox = durable_limits.hit(durable_limits.VERIFY_PER_MAILBOX, _cap_key(email))
+    if h_mailbox is None:
+        raise _too_many()
+    if durable_limits.hit(durable_limits.VERIFY_GLOBAL, durable_limits.GLOBAL_KEY) is None:
+        durable_limits.refund(h_mailbox)         # the ceiling refused, not this visitor's guessing
+        raise _too_many()
 
     conn = get_conn()
     cur  = conn.cursor()
@@ -595,6 +620,22 @@ def create_calculator_lead(payload: CalcLeadCreate,
         conn.close()
 
 
+def _mark_sent(lead_id: str) -> bool:
+    """email_sent = TRUE, only called AFTER the mail was really sent. Up to 3 tries, each on a FRESH connection (the request's own may be dead)."""
+    for _ in range(3):
+        try:
+            c = get_conn()
+            try:
+                c.cursor().execute("UPDATE calculator_leads SET email_sent = TRUE WHERE id = %s", (lead_id,))
+                c.commit()
+                return True
+            finally:
+                c.close()
+        except Exception as e:
+            logger.error("[CALC] Failed to mark results email sent for %s: %s", lead_id, type(e).__name__)
+    return False
+
+
 @router.patch("/calculator-lead/{lead_id}")
 def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
                            _gate: None = Depends(_ip_gate(rate_limits.UPDATE_PER_IP, "calc_update_ip"))):
@@ -602,24 +643,26 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
     Live save — called ~900ms after the user stops typing.
     Sends the results email once when there is meaningful data.
     Email is already verified at this point so no numeric threshold needed.
-    At most 3 results emails per address per day (consumed before sending; the lead is still saved when over).
+    Exactly-once sending: a durable per-lead mutex (RESULTS_CLAIM, 1 per hour, expires by itself) serialises concurrent saves; email_sent is set
+    TRUE only after the mail really went out. At most 3 results emails per mailbox per day (the lead is still saved when over).
     """
     try:
-        uuid.UUID(lead_id)
+        if str(uuid.UUID(lead_id)) != lead_id.lower():
+            raise ValueError
     except ValueError:
         raise HTTPException(status_code=404, detail="Lead not found")
+    lead_id = lead_id.lower()
     inputs_json  = _json_text(payload.inputs, "inputs")
     results_json = _json_text(payload.results, "results")
 
     conn = get_conn()
     cur  = conn.cursor()
-    claimed = False
     try:
         cur.execute("""
             UPDATE calculator_leads
             SET inputs = %s, results = %s, updated_at = NOW()
             WHERE id = %s
-            RETURNING name, company, email
+            RETURNING name, company, email, email_sent
         """, (inputs_json, results_json, lead_id))
         row = cur.fetchone()
         conn.commit()
@@ -630,7 +673,6 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
         r = payload.results or {}
         i = payload.inputs or {}
 
-        # Send the results email once, when there's real data. Email is already verified so no other threshold is needed.
         # Anything that is not a finite number counts as 0 (never raises): a lead with junk numbers is saved and simply gets no mail.
         meaningful = (
             _num(i.get("adSpend", 0)) > 0
@@ -638,33 +680,32 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
             and _num(r.get("trueCpl", 0)) > 0
         )
 
-        if meaningful:
-            # Atomic claim: only the request whose UPDATE flips email_sent FALSE -> TRUE may send, so two concurrent saves can never both send.
-            cur.execute("UPDATE calculator_leads SET email_sent = TRUE WHERE id = %s AND email_sent = FALSE RETURNING id", (lead_id,))
-            claimed = cur.fetchone() is not None
-            conn.commit()
-
-        if claimed:
-            sent = False
-            h = None
-            try:
-                h = durable_limits.hit(durable_limits.RESULTS_PER_MAILBOX, _cap_key(str(row["email"]).strip().lower()))
-                if h is not None:
-                    sent = send_results_email(row["name"], row["company"], row["email"], r, i)
-                    if not sent:
-                        durable_limits.refund(h)         # nothing was delivered: do not burn the address's daily allowance
-            finally:
-                if not sent:
-                    # capped, failed, or interrupted: the claim goes back so a later save can still deliver the mail
-                    cur.execute("UPDATE calculator_leads SET email_sent = FALSE WHERE id = %s", (lead_id,))
-                    conn.commit()
+        if meaningful and not row["email_sent"]:
+            h_claim = durable_limits.hit(durable_limits.RESULTS_CLAIM, lead_id)       # None: another save holds it (or the limiter is down): no mail
+            if h_claim is not None:
+                h_mailbox = None
+                sent = False
+                try:
+                    h_mailbox = durable_limits.hit(durable_limits.RESULTS_PER_MAILBOX, _cap_key(str(row["email"]).strip().lower()))
+                    if h_mailbox is not None:
+                        sent = send_results_email(row["name"], row["company"], row["email"], r, i)
+                finally:
+                    if sent:
+                        _mark_sent(lead_id)          # the claim row stays: it blocks a second send for the hour even if this UPDATE failed
+                    else:
+                        # capped, failed or interrupted: nothing was delivered, give both allowances back so the next save can still deliver
+                        durable_limits.refund(h_mailbox)
+                        durable_limits.refund(h_claim)
 
         return {"status": "ok"}
 
     except HTTPException:
         raise
     except Exception as e:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass                                    # the connection may already be gone
         logger.error("[CALC] Failed to update lead %s: %s", lead_id, type(e).__name__)
         raise HTTPException(status_code=500, detail="Failed to update lead")
     finally:

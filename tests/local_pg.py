@@ -44,6 +44,12 @@ def start():
     dsn = f"postgresql://cdai@/postgres?host={tmp}&port={port}"
     import psycopg2
     c = psycopg2.connect(dsn); c.autocommit = True
-    c.cursor().execute(DDL); c.close()
+    cur = c.cursor()
+    # Supabase-like roles and default grants, so "no rights for anon/authenticated" is a real assertion and not a vacuous one
+    cur.execute("""CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN;
+                   ALTER DEFAULT PRIVILEGES FOR ROLE cdai IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated;
+                   ALTER DEFAULT PRIVILEGES FOR ROLE cdai IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated;
+                   GRANT USAGE ON SCHEMA public TO anon, authenticated;""")
+    cur.execute(DDL); c.close()
     os.environ["DATABASE_URL"] = dsn
     return dsn

@@ -10,8 +10,13 @@ Contract
   refund(handle) deletes that hit (used when the mail it paid for was never sent, so a failed send does not burn the visitor's allowance).
 One transaction per allow(): pg_advisory_xact_lock on (bucket, key) serialises concurrent callers for the same key, so N concurrent requests can never
 record more than `limit` hits. Fails CLOSED: a database error is "over the cap" (None), and the caller sends nothing.
-Keys are stored hashed (SHA-256, first 32 hex), never as an e-mail address. Rows older than 2 days are purged opportunistically.
-Table: created idempotently on first use per process (same pattern as calculator_views); no migration step.
+Keys are stored hashed (SHA-256, first 32 hex), never as an e-mail address. Rows older than 2 days are purged opportunistically, in bounded
+batches, single-flight, on a daemon thread (never on a request).
+Table: if it already exists with both indexes nothing is run; otherwise it is created idempotently (same self-creating pattern as calculator_views),
+with row level security on and no rights for the Supabase client roles, like the other calculator tables. A role that cannot create it fails closed
+and logs ONE line per process.
+Every connection has a connect timeout; every decision transaction has lock_timeout 2 s and statement_timeout 5 s, so a stuck lock or a slow
+database makes allow() return None (refuse) instead of hanging the request.
 """
 import hashlib
 import logging
@@ -20,12 +25,18 @@ import threading
 from typing import NamedTuple, Optional
 
 import psycopg2
+import psycopg2.errors
 
 logger = logging.getLogger("cdai.calculator_leads")
 
 PURGE_AFTER = "2 days"          # longest window is 1 day
 PURGE_EVERY_CALLS = 100         # opportunistic purge cadence (calls per process)
+PURGE_BATCH = 1000              # rows per DELETE
+PURGE_MAX_BATCHES = 20          # per purge run
+CONNECT_TIMEOUT_S = 5
 _DDL_LOCK_ID = 7305210001       # advisory lock id for the CREATE statements (concurrent first use, several workers)
+_PURGE_LOCK_ID = 7305210002     # single-flight purge across workers
+_INDEXES = ("calculator_rate_events_bucket_key_at", "calculator_rate_events_at")
 
 _DDL = (
     """CREATE TABLE IF NOT EXISTS calculator_rate_events (
@@ -36,6 +47,19 @@ _DDL = (
        )""",
     "CREATE INDEX IF NOT EXISTS calculator_rate_events_bucket_key_at ON calculator_rate_events (bucket, key, at)",
     "CREATE INDEX IF NOT EXISTS calculator_rate_events_at ON calculator_rate_events (at)",     # serves the purge
+    # Same posture as calculator_leads / otps / views in production: RLS on, no policies, no rights for the PostgREST roles.
+    "ALTER TABLE calculator_rate_events ENABLE ROW LEVEL SECURITY",
+    """DO $$
+       DECLARE r text; seq text;
+       BEGIN
+         seq := pg_get_serial_sequence('calculator_rate_events', 'id');
+         FOREACH r IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+           IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+             EXECUTE format('REVOKE ALL ON TABLE calculator_rate_events FROM %I', r);
+             IF seq IS NOT NULL THEN EXECUTE format('REVOKE ALL ON SEQUENCE %s FROM %I', seq, r); END IF;
+           END IF;
+         END LOOP;
+       END $$""",
 )
 
 
@@ -48,77 +72,118 @@ class Cap(NamedTuple):
 SEND_CODE_PER_MAILBOX = Cap("code_mailbox", 3, 3600)
 SEND_CODE_GLOBAL = Cap("global_code", 100, 3600)      # circuit breaker across the whole service; key is always "*"
 VERIFY_PER_MAILBOX = Cap("verify_mailbox", 6, 600)
+VERIFY_GLOBAL = Cap("global_verify", 300, 3600)       # bounds durable verify writes whatever the number of IPs; key is always "*"
 RESULTS_PER_MAILBOX = Cap("results_mailbox", 3, 86400)
+RESULTS_CLAIM = Cap("results_claim", 1, 3600)         # per-lead mutex around "send the results mail"; expires by itself if the process dies
 GLOBAL_KEY = "*"
 
 _ready = False
 _ready_lock = threading.Lock()
+_ddl_failure_logged = False
 _calls = 0
 _calls_lock = threading.Lock()
+_purge_thread = None
+
+
+class TableUnavailable(Exception):
+    """The table does not exist and could not be created (already logged once per process)."""
 
 
 def connect():
-    return psycopg2.connect(os.getenv("DATABASE_URL"))
+    return psycopg2.connect(os.getenv("DATABASE_URL"), connect_timeout=CONNECT_TIMEOUT_S)
 
 
 def _hash(key: str) -> str:
     return hashlib.sha256(key.encode("utf8")).hexdigest()[:32]
 
 
+def _timeouts(cur) -> None:
+    cur.execute("SET LOCAL lock_timeout = '2s'")
+    cur.execute("SET LOCAL statement_timeout = '5s'")
+
+
 def ensure_table() -> None:
-    """Create the table and indexes once per process. Raises on failure (callers fail closed)."""
-    global _ready
+    """Make sure the table and both indexes exist, once per process. If they already exist NOTHING is run (so a role without CREATE works once the
+    table has been created). Raises TableUnavailable when it is missing and cannot be created."""
+    global _ready, _ddl_failure_logged
     if _ready:
         return
     with _ready_lock:
         if _ready:
             return
-        conn = connect()
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK_ID,))   # CREATE ... IF NOT EXISTS can still race across workers
-            for stmt in _DDL:
-                cur.execute(stmt)
-            conn.commit()
-            _ready = True
-        finally:
-            conn.close()
+            conn = connect()
+            try:
+                cur = conn.cursor()
+                _timeouts(cur)
+                cur.execute("SELECT to_regclass('public.calculator_rate_events') IS NOT NULL AND "
+                            "(SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'calculator_rate_events' AND indexname = ANY(%s)) = %s",
+                            (list(_INDEXES), len(_INDEXES)))
+                complete = cur.fetchone()[0]
+                if not complete:
+                    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK_ID,))   # CREATE ... IF NOT EXISTS can still race across workers
+                    for stmt in _DDL:
+                        cur.execute(stmt)
+                conn.commit()
+                _ready = True
+            finally:
+                conn.close()
+        except Exception as e:
+            if not _ddl_failure_logged:
+                _ddl_failure_logged = True
+                logger.error("[CALC] cannot prepare calculator_rate_events (%s); durable caps refuse every request until it exists", type(e).__name__)
+            raise TableUnavailable() from e
 
 
 def purge() -> int:
-    """Delete rows older than PURGE_AFTER. Returns rows deleted; never raises."""
+    """Delete rows older than PURGE_AFTER in batches of PURGE_BATCH (at most PURGE_MAX_BATCHES per run). Single-flight across workers via
+    pg_try_advisory_xact_lock: if another purge holds it, do nothing. Returns rows deleted; never raises."""
+    total = 0
     try:
-        conn = connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(f"DELETE FROM calculator_rate_events WHERE at < NOW() - INTERVAL '{PURGE_AFTER}'")
-            n = cur.rowcount
-            conn.commit()
-            return n
-        finally:
-            conn.close()
+        for _ in range(PURGE_MAX_BATCHES):
+            conn = connect()
+            try:
+                cur = conn.cursor()
+                _timeouts(cur)
+                cur.execute("SELECT pg_try_advisory_xact_lock(%s)", (_PURGE_LOCK_ID,))
+                if not cur.fetchone()[0]:
+                    conn.commit()
+                    return total
+                cur.execute("DELETE FROM calculator_rate_events WHERE id IN (SELECT id FROM calculator_rate_events "
+                            f"WHERE at < NOW() - INTERVAL '{PURGE_AFTER}' LIMIT %s)", (PURGE_BATCH,))
+                n = cur.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+            total += n
+            if n < PURGE_BATCH:
+                break
     except Exception as e:
         logger.error("[CALC] rate-event purge failed: %s", type(e).__name__)
-        return 0
+    return total
 
 
 def _maybe_purge() -> None:
-    global _calls
+    """Every PURGE_EVERY_CALLS-th call starts a purge on a daemon thread (one at a time per process); the request never waits for it."""
+    global _calls, _purge_thread
     with _calls_lock:
         _calls += 1
         due = _calls % PURGE_EVERY_CALLS == 0
-    if due:
-        purge()
+        if due and (_purge_thread is None or not _purge_thread.is_alive()):
+            _purge_thread = threading.Thread(target=purge, daemon=True)
+            _purge_thread.start()
 
 
 def allow(bucket: str, key: str, limit: int, window_seconds: int) -> Optional[int]:
     """Record one hit if fewer than `limit` hits for (bucket, key) fall in the last `window_seconds`. Returns the row id, or None (over cap or error)."""
+    global _ready
     try:
         ensure_table()
         k = _hash(key)
         conn = connect()
         try:
             cur = conn.cursor()
+            _timeouts(cur)
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (bucket + ":" + k,))
             cur.execute(
                 "SELECT count(*) FROM calculator_rate_events WHERE bucket = %s AND key = %s AND at > clock_timestamp() - make_interval(secs => %s)",
@@ -132,7 +197,11 @@ def allow(bucket: str, key: str, limit: int, window_seconds: int) -> Optional[in
                 conn.commit()
         finally:
             conn.close()
+    except TableUnavailable:
+        return None
     except Exception as e:
+        if isinstance(e, psycopg2.errors.UndefinedTable):
+            _ready = False                  # the table was dropped under us: re-ensure on the next call (self-heal)
         logger.error("[CALC] durable limiter error: %s", type(e).__name__)
         return None
     _maybe_purge()
@@ -151,6 +220,7 @@ def refund(handle: Optional[int]) -> bool:
         conn = connect()
         try:
             cur = conn.cursor()
+            _timeouts(cur)
             cur.execute("DELETE FROM calculator_rate_events WHERE id = %s", (handle,))
             conn.commit()
             return True
