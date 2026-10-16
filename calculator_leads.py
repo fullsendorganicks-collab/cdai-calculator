@@ -13,16 +13,23 @@ lead_events, cost_events, etc).
 
 import os
 import json
+import math
+import re
 import uuid
-import random
+import secrets
 import logging
 from datetime import datetime, timezone
+from html import escape as _escape
 from typing import Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+
+import durable_limits
+import rate_limits
+from client_ip import real_client_ip, ip_bucket
 
 logger = logging.getLogger("cdai.calculator_leads")
 
@@ -32,9 +39,112 @@ BEEHIIV_PUB_ID  = os.getenv("BEEHIIV_PUBLICATION_ID")
 
 router = APIRouter()
 
+# ── Abuse caps and input limits (Oct 14 2026) ────────────────────────────────
+# These endpoints are public and two of them send mail from our own sending domain to an address the caller chooses. Caps live in rate_limits.py
+# and are checked BEFORE any database or email work. The numbers are in rate_limits.py; the caller is never told which one tripped.
+NAME_MAX, COMPANY_MAX, EMAIL_MAX, SESSION_ID_MAX, JSON_MAX_CHARS = 100, 200, 254, 100, 20000
+SUBJECT_MAX = 200
+TOO_MANY_DETAIL = "Too many requests. Please try again later."
+_EMAIL_RE = re.compile(r"[^@\s<>\",;()\[\]\\\x00-\x1f\x7f]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z][A-Za-z0-9-]{1,}")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CODE_RE = re.compile(r"[0-9]{6}")
+
+
+def _too_many() -> HTTPException:
+    return HTTPException(status_code=429, detail=TOO_MANY_DETAIL)
+
+
+def _ip_gate(limit, namespace: str):
+    """FastAPI dependency: consume one per-IP hit before the body is validated and before any database or email work."""
+    def gate(request: Request) -> None:
+        if not rate_limits.allow(limit, ip_bucket(real_client_ip(request)), namespace):
+            raise _too_many()
+    return gate
+
+
+def _single_line(text: str) -> str:
+    """Control characters (CR/LF etc.) replaced by a space, so a value can never add a mail header line or break the subject."""
+    return _CONTROL_RE.sub(" ", text).strip()
+
+
+def _encodable(v: str) -> bool:
+    """False for text that cannot be stored (a lone surrogate from a JSON \\ud800 escape cannot be encoded as UTF-8: it would be a 500 at insert)."""
+    try:
+        v.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _clean_email(raw: str) -> str:
+    """Normalised (stripped, lower-case) address, or HTTP 400. Conservative: no whitespace, control characters or angle brackets, <= 254 chars."""
+    v = (raw or "").strip().lower()
+    if len(v) > EMAIL_MAX or not _encodable(v) or not _EMAIL_RE.fullmatch(v):
+        raise HTTPException(status_code=400, detail="Valid email required")
+    return v
+
+
+_GOOGLE_DOMAINS = ("gmail.com", "googlemail.com")
+
+
+def _cap_key(email: str) -> str:
+    """The mailbox an address really delivers to, used ONLY as the per-address rate-limit key (the stored address and the code lookup stay exact).
+    `+tag` is dropped (every provider delivers a+x@d to a@d); dots are dropped and googlemail.com is read as gmail.com for Google addresses only (dots
+    mean something at other providers). Without this, one mailbox has unlimited per-address buckets (a+1@, a+2@, a.b@, ...) and could be mail-bombed."""
+    local, _, domain = email.rpartition("@")
+    local = local.split("+", 1)[0]
+    if domain in _GOOGLE_DOMAINS:
+        local, domain = local.replace(".", ""), "gmail.com"
+    return f"{local}@{domain}"
+
+
+def _clean_text(raw: str, max_len: int, label: str) -> str:
+    v = (raw or "").strip()
+    if len(v) > max_len:
+        raise HTTPException(status_code=400, detail=f"{label} too long")
+    if _CONTROL_RE.search(v) or not _encodable(v):
+        raise HTTPException(status_code=400, detail=f"{label} contains invalid characters")
+    return v
+
+
+# In JSON text produced with ensure_ascii, jsonb rejects \u0000 and a lone surrogate escape. Pairs are kept, an escaped backslash is consumed first so
+# that "\\\\u0000" (a literal backslash followed by u0000) is left alone.
+_JSON_BAD_ESCAPES = re.compile(
+    r"(\\\\)|(\\u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2})|\\u0000|\\u[dD][89a-fA-F][0-9a-fA-F]{2}")
+
+
+def _strip_bad_escapes(text: str) -> str:
+    return _JSON_BAD_ESCAPES.sub(lambda m: m.group(0) if (m.group(1) or m.group(2)) else "", text)
+
+
+def _json_text(v: Optional[dict], label: str) -> str:
+    """The JSON text to store for inputs/results: always valid for Postgres jsonb, size-capped (413) AFTER sanitising. NUL characters and lone
+    surrogates (in strings and keys) are removed; non-finite numbers (NaN, Infinity), which Python accepts from a client but jsonb rejects, become
+    null. Unserialisable or pathologically nested values are 400."""
+    if not v:
+        return "{}"
+    try:
+        text = json.dumps(json.loads(_strip_bad_escapes(json.dumps(v)), parse_constant=lambda _c: None))
+    except (TypeError, ValueError, RecursionError):
+        raise HTTPException(status_code=400, detail=f"{label} not valid")
+    if len(text) > JSON_MAX_CHARS:
+        raise HTTPException(status_code=413, detail=f"{label} too large")
+    return text
+
+
+def _num(v) -> float:
+    """A finite real number, else 0. Strings, None, booleans, NaN/Infinity and ints too large for a float are all 'no number' (0), so a hostile or
+    sloppy client can never make an arithmetic comparison or a format call raise."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    try:
+        return v if math.isfinite(v) else 0
+    except OverflowError:
+        return 0
+
 
 def get_conn():
-    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor, connect_timeout=5)
 
 
 _VIEWS_TABLE_READY = False
@@ -104,9 +214,9 @@ def _subscribe_beehiiv(email: str) -> None:
             },
             timeout=5,
         )
-        logger.info(f"[CALC] Beehiiv subscribed: {email}")
+        logger.info("[CALC] Beehiiv subscribe requested")
     except Exception as e:
-        logger.error(f"[CALC] Beehiiv subscribe failed for {email}: {e}")
+        logger.error("[CALC] Beehiiv subscribe failed: %s", type(e).__name__)
 
 
 # ── Email helpers ─────────────────────────────────────────────────────────────
@@ -155,7 +265,7 @@ def send_otp_email(name: str, email: str, code: str) -> bool:
 <div class="wrap">
   <span class="eyebrow">Allocera Intelligence — Distortion Calculator</span>
   <h1>Your verification code</h1>
-  <p class="sub">Hi {name} — enter this code to unlock your calculator and see your true CPL.</p>
+  <p class="sub">Hi {_escape(name)} — enter this code to unlock your calculator and see your true CPL.</p>
   <div class="code-box">
     <span class="code">{code}</span>
     <span class="expires">Expires in 10 minutes</span>
@@ -176,10 +286,10 @@ def send_otp_email(name: str, email: str, code: str) -> bool:
             "subject": f"Your Distortion Calculator code: {code}",
             "html": html,
         })
-        logger.info(f"[CALC] OTP sent to {email}")
+        logger.info("[CALC] OTP email sent")
         return True
     except Exception as e:
-        logger.error(f"[CALC] OTP email failed for {email}: {e}")
+        logger.error("[CALC] OTP email failed: %s", type(e).__name__)
         return False
 
 
@@ -193,11 +303,11 @@ def send_results_email(name: str, company: str, email: str,
             return False
         resend.api_key = api_key
 
-        reported_cpl = results.get("reportedCpl", 0)
-        true_cpl     = results.get("trueCpl", 0)
-        hidden_costs = results.get("hiddenCosts", 0)
-        cm_pct       = results.get("cmPct", 0)
-        cpl_gap_pct  = results.get("cplGapPct", 0)
+        reported_cpl = _num(results.get("reportedCpl", 0))
+        true_cpl     = _num(results.get("trueCpl", 0))
+        hidden_costs = _num(results.get("hiddenCosts", 0))
+        cm_pct       = _num(results.get("cmPct", 0))
+        cpl_gap_pct  = _num(results.get("cplGapPct", 0))
 
         cm_color = "#0BAF92" if cm_pct >= 0 else "#D63050"
         cm_sign  = "+" if cm_pct >= 0 else ""
@@ -205,10 +315,12 @@ def send_results_email(name: str, company: str, email: str,
         gap_abs  = abs(cpl_gap_pct)
         cpl_diff = abs(true_cpl - reported_cpl)
 
+        # Subject is plain text: control characters out (no header injection), length capped. The body gets the HTML-escaped copy.
         subject = (
-            f"Your distortion audit — {company} "
+            f"Your distortion audit — {_single_line(company)} "
             f"({_fmt(true_cpl)} true CPL vs {_fmt(reported_cpl)} reported)"
-        )
+        )[:SUBJECT_MAX]
+        company_html = _escape(company)
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -257,7 +369,7 @@ def send_results_email(name: str, company: str, email: str,
 <body>
 <div class="wrap">
   <span class="eyebrow">Allocera Intelligence — Distortion Calculator Results</span>
-  <h1>Your true CPL for {company}</h1>
+  <h1>Your true CPL for {company_html}</h1>
   <p class="sub">Here's what the calculator found — the gap between what your ad platform reports and what you're actually paying after every hidden cost layer.</p>
   <table class="cpl"><tr>
     <td class="cpl-rep"><span class="cpl-lbl">What your dashboard reports</span><span class="cpl-val">{_fmt(reported_cpl)}</span></td>
@@ -287,7 +399,7 @@ def send_results_email(name: str, company: str, email: str,
   </div>
   <div class="newsletter">
     <p class="nl-title">The Margin Gap — Free Newsletter</p>
-    <p class="nl-desc">Marketing margin intelligence for paid acquisition operators. The cost layers your dashboard never shows. Every two weeks, free.</p>
+    <p class="nl-desc">Marketing margin intelligence for paid acquisition operators. The cost layers your dashboard never shows. Free.</p>
     <a class="btn-gold" href="https://allocera-intelligence.beehiiv.com/subscribe" target="_blank">Subscribe Free &rarr;</a>
   </div>
   <div class="footer">
@@ -307,23 +419,28 @@ def send_results_email(name: str, company: str, email: str,
             "subject": subject,
             "html": html,
         })
-        logger.info(f"[CALC] Results email sent to {email} ({company})")
+        logger.info("[CALC] Results email sent")
         return True
     except Exception as e:
-        logger.error(f"[CALC] Results email failed for {email}: {e}")
+        logger.error("[CALC] Results email failed: %s", type(e).__name__)
         return False
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/calculator-view")
-def log_view(payload: ViewPing):
+def log_view(payload: ViewPing, request: Request):
     """
     Anonymous funnel-entry ping — fired once when the calculator panel
     scrolls into view, before any name/company/email is entered. No PII.
     Lets us measure viewed -> started (OTP requested) -> verified (lead)
     instead of only ever seeing the last stage.
+    Over the cap or an oversize session_id: answers ok and stores nothing.
     """
+    if not rate_limits.allow(rate_limits.VIEW_PER_IP, ip_bucket(real_client_ip(request)), "calc_view_ip"):
+        return {"status": "ok"}
+    if payload.session_id is not None and len(payload.session_id) > SESSION_ID_MAX:
+        return {"status": "ok"}
     conn = get_conn()
     cur = conn.cursor()
     try:
@@ -336,7 +453,7 @@ def log_view(payload: ViewPing):
         return {"status": "ok"}
     except Exception as e:
         conn.rollback()
-        logger.error(f"[CALC] Failed to log view: {e}")
+        logger.error("[CALC] Failed to log view: %s", type(e).__name__)
         # Never let tracking failure surface to the visitor.
         return {"status": "ok"}
     finally:
@@ -344,21 +461,50 @@ def log_view(payload: ViewPing):
 
 
 @router.post("/calculator-send-code")
-def send_code(payload: SendCodeRequest):
+def send_code(payload: SendCodeRequest,
+              _gate: None = Depends(_ip_gate(rate_limits.SEND_CODE_PER_IP, "calc_code_ip"))):
     """
     Step 1 — gate. Generate a 6-digit OTP, store it, email it.
     Nothing is saved to calculator_leads until the code is verified.
+    Caps (nothing is stored or sent when one refuses): per IP bucket (in memory, a dependency consumed on every attempt), then per mailbox
+    (3/hour) and one service-wide ceiling (100 OTP mails/hour), both durable in PostgreSQL. A send that fails gives its allowance back.
     """
-    email   = payload.email.strip().lower()
-    name    = payload.name.strip()
-    company = payload.company.strip()
+    email   = _clean_email(payload.email)
+    name    = _clean_text(payload.name, NAME_MAX, "Name")
+    company = _clean_text(payload.company, COMPANY_MAX, "Company")
 
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Valid email required")
+    h_mailbox = durable_limits.hit(durable_limits.SEND_CODE_PER_MAILBOX, _cap_key(email))
+    if h_mailbox is None:
+        raise _too_many()
+    h_global = durable_limits.hit(durable_limits.SEND_CODE_GLOBAL, durable_limits.GLOBAL_KEY)
+    if h_global is None:
+        durable_limits.refund(h_mailbox)         # the visitor did nothing wrong: the service ceiling is what refused
+        raise _too_many()
 
-    code = str(random.randint(0, 999999)).zfill(6)
+    def give_back(otp_id=None):
+        """The code was not delivered: remove its row and return both allowances."""
+        if otp_id is not None:
+            try:
+                c = get_conn()
+                try:
+                    c.cursor().execute("DELETE FROM calculator_otps WHERE id = %s", (otp_id,))
+                    c.commit()
+                finally:
+                    c.close()
+            except Exception as e:
+                logger.error("[CALC] Failed to remove undelivered OTP: %s", type(e).__name__)
+        durable_limits.refund(h_mailbox)
+        durable_limits.refund(h_global)
 
-    conn = get_conn()
+    code = f"{secrets.randbelow(10**6):06d}"
+
+    otp_id = None
+    try:
+        conn = get_conn()
+    except Exception as e:
+        give_back()
+        logger.error("[CALC] Failed to store OTP: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to send code")
     cur  = conn.cursor()
     try:
         # Note: previously this deleted prior unverified codes for this email
@@ -369,31 +515,53 @@ def send_code(payload: SendCodeRequest):
         cur.execute("""
             INSERT INTO calculator_otps (email, name, company, code, expires_at)
             VALUES (%s, %s, %s, %s, NOW() + INTERVAL '10 minutes')
+            RETURNING id
         """, (email, name, company, code))
+        otp_id = cur.fetchone()["id"]
         conn.commit()
     except Exception as e:
         conn.rollback()
-        logger.error(f"[CALC] Failed to store OTP for {email}: {e}")
+        give_back()
+        logger.error("[CALC] Failed to store OTP: %s", type(e).__name__)
         raise HTTPException(status_code=500, detail="Failed to send code")
     finally:
         conn.close()
 
     sent = send_otp_email(name, email, code)
     if not sent:
+        give_back(otp_id)
         raise HTTPException(status_code=500, detail="Failed to send code email")
 
-    logger.info(f"[CALC] OTP sent: {email}")
     return {"status": "sent"}
 
 
 @router.post("/calculator-lead")
-def create_calculator_lead(payload: CalcLeadCreate):
+def create_calculator_lead(payload: CalcLeadCreate,
+                           _gate: None = Depends(_ip_gate(rate_limits.VERIFY_PER_IP, "calc_verify_ip"))):
     """
     Step 2 — verify OTP, create the lead row, subscribe Beehiiv, return {id}.
-    Code must match and not be expired.
+    Code must match and not be expired. Every attempt (right or wrong code) consumes the per-IP and per-address
+    caps first, so the 6-digit code cannot be brute-forced inside its 10 minute life.
     """
-    email   = payload.email.strip().lower()
-    code    = payload.code.strip()
+    email   = _clean_email(payload.email)
+    name    = _clean_text(payload.name, NAME_MAX, "Name")
+    company = _clean_text(payload.company, COMPANY_MAX, "Company")
+    inputs_json  = _json_text(payload.inputs, "inputs")
+    results_json = _json_text(payload.results, "results")
+
+    code = (payload.code or "").strip()
+    if not _CODE_RE.fullmatch(code):
+        # Codes are always 6 ASCII digits; anything else can never match, so it neither costs a guess nor touches the database.
+        raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    # Everything cheap and stateless is validated above. From here every attempt, right or wrong code, is consumed BEFORE the code lookup; durable, so a
+    # restart or a second worker cannot reset the guess budget. The service-wide verify ceiling bounds durable writes whatever the number of IPs.
+    h_mailbox = durable_limits.hit(durable_limits.VERIFY_PER_MAILBOX, _cap_key(email))
+    if h_mailbox is None:
+        raise _too_many()
+    if durable_limits.hit(durable_limits.VERIFY_GLOBAL, durable_limits.GLOBAL_KEY) is None:
+        durable_limits.refund(h_mailbox)         # the ceiling refused, not this visitor's guessing
+        raise _too_many()
 
     conn = get_conn()
     cur  = conn.cursor()
@@ -411,7 +579,6 @@ def create_calculator_lead(payload: CalcLeadCreate):
         otp = cur.fetchone()
 
         if not otp:
-            conn.close()
             raise HTTPException(status_code=400, detail="Invalid or expired code")
 
         # Mark OTP as verified
@@ -429,14 +596,14 @@ def create_calculator_lead(payload: CalcLeadCreate):
             VALUES (%s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
         """, (
             lead_id,
-            payload.name.strip(),
-            payload.company.strip(),
+            name,
+            company,
             email,
-            json.dumps(payload.inputs or {}),
-            json.dumps(payload.results or {}),
+            inputs_json,
+            results_json,
         ))
         conn.commit()
-        logger.info(f"[CALC] Verified + lead created: {email} / {payload.company}")
+        logger.info("[CALC] Verified + lead created: %s", lead_id)
 
         # Subscribe to Beehiiv (fire and forget)
         _subscribe_beehiiv(email)
@@ -447,19 +614,47 @@ def create_calculator_lead(payload: CalcLeadCreate):
         raise
     except Exception as e:
         conn.rollback()
-        logger.error(f"[CALC] Failed to verify/create lead for {email}: {e}")
+        logger.error("[CALC] Failed to verify/create lead: %s", type(e).__name__)
         raise HTTPException(status_code=500, detail="Verification failed")
     finally:
         conn.close()
 
 
+def _mark_sent(lead_id: str) -> bool:
+    """email_sent = TRUE, only called AFTER the mail was really sent. Up to 3 tries, each on a FRESH connection (the request's own may be dead)."""
+    for _ in range(3):
+        try:
+            c = get_conn()
+            try:
+                c.cursor().execute("UPDATE calculator_leads SET email_sent = TRUE WHERE id = %s", (lead_id,))
+                c.commit()
+                return True
+            finally:
+                c.close()
+        except Exception as e:
+            logger.error("[CALC] Failed to mark results email sent for %s: %s", lead_id, type(e).__name__)
+    return False
+
+
 @router.patch("/calculator-lead/{lead_id}")
-def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate):
+def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
+                           _gate: None = Depends(_ip_gate(rate_limits.UPDATE_PER_IP, "calc_update_ip"))):
     """
     Live save — called ~900ms after the user stops typing.
     Sends the results email once when there is meaningful data.
     Email is already verified at this point so no numeric threshold needed.
+    Exactly-once sending: a durable per-lead mutex (RESULTS_CLAIM, 1 per hour, expires by itself) serialises concurrent saves; email_sent is set
+    TRUE only after the mail really went out. At most 3 results emails per mailbox per day (the lead is still saved when over).
     """
+    try:
+        if str(uuid.UUID(lead_id)) != lead_id.lower():
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    lead_id = lead_id.lower()
+    inputs_json  = _json_text(payload.inputs, "inputs")
+    results_json = _json_text(payload.results, "results")
+
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -468,11 +663,7 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate):
             SET inputs = %s, results = %s, updated_at = NOW()
             WHERE id = %s
             RETURNING name, company, email, email_sent
-        """, (
-            json.dumps(payload.inputs or {}),
-            json.dumps(payload.results or {}),
-            lead_id,
-        ))
+        """, (inputs_json, results_json, lead_id))
         row = cur.fetchone()
         conn.commit()
 
@@ -482,34 +673,40 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate):
         r = payload.results or {}
         i = payload.inputs or {}
 
-        # Send results email once when there's real data.
-        # Email is already verified so no spend/lead minimums needed.
-        should_email = (
-            not row["email_sent"]
-            and i.get("adSpend", 0) > 0
-            and i.get("leads", 0) > 0
-            and r.get("trueCpl", 0) > 0
+        # Anything that is not a finite number counts as 0 (never raises): a lead with junk numbers is saved and simply gets no mail.
+        meaningful = (
+            _num(i.get("adSpend", 0)) > 0
+            and _num(i.get("leads", 0)) > 0
+            and _num(r.get("trueCpl", 0)) > 0
         )
 
-        if should_email:
-            sent = send_results_email(
-                row["name"], row["company"], row["email"], r, i
-            )
-            if sent:
-                cur2 = conn.cursor()
-                cur2.execute(
-                    "UPDATE calculator_leads SET email_sent = TRUE WHERE id = %s",
-                    (lead_id,)
-                )
-                conn.commit()
+        if meaningful and not row["email_sent"]:
+            h_claim = durable_limits.hit(durable_limits.RESULTS_CLAIM, lead_id)       # None: another save holds it (or the limiter is down): no mail
+            if h_claim is not None:
+                h_mailbox = None
+                sent = False
+                try:
+                    h_mailbox = durable_limits.hit(durable_limits.RESULTS_PER_MAILBOX, _cap_key(str(row["email"]).strip().lower()))
+                    if h_mailbox is not None:
+                        sent = send_results_email(row["name"], row["company"], row["email"], r, i)
+                finally:
+                    if sent:
+                        _mark_sent(lead_id)          # the claim row stays: it blocks a second send for the hour even if this UPDATE failed
+                    else:
+                        # capped, failed or interrupted: nothing was delivered, give both allowances back so the next save can still deliver
+                        durable_limits.refund(h_mailbox)
+                        durable_limits.refund(h_claim)
 
         return {"status": "ok"}
 
     except HTTPException:
         raise
     except Exception as e:
-        conn.rollback()
-        logger.error(f"[CALC] Failed to update lead {lead_id}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass                                    # the connection may already be gone
+        logger.error("[CALC] Failed to update lead %s: %s", lead_id, type(e).__name__)
         raise HTTPException(status_code=500, detail="Failed to update lead")
     finally:
         conn.close()
