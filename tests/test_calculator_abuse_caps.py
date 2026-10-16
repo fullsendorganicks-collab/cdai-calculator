@@ -577,11 +577,18 @@ _real_dl_connect = dl.connect
 def slow_on(): dl.connect = lambda: SlowConn(_real_dl_connect())
 def slow_off(): dl.connect = _real_dl_connect
 def burst(n_threads, fn):
+    """N simultaneous requests. The limiter's lock timeout is widened for the duration: these tests prove MUTUAL EXCLUSION (exact counts), not speed. With the
+    production 2 s a loaded machine refuses the tail of a 330-wide queue (fail closed, by design), which would make an exact count depend on the machine."""
     barrier = threading.Barrier(n_threads); out = [None] * n_threads
     def run(i):
         c = TestClient(app); barrier.wait(); out[i] = fn(c, i)
-    ts = [threading.Thread(target=run, args=(i,)) for i in range(n_threads)]
-    [t.start() for t in ts]; [t.join(120) for t in ts]
+    saved = dl.LOCK_TIMEOUT_S, dl.STATEMENT_TIMEOUT_S
+    dl.LOCK_TIMEOUT_S, dl.STATEMENT_TIMEOUT_S = 120, 120
+    try:
+        ts = [threading.Thread(target=run, args=(i,)) for i in range(n_threads)]
+        [t.start() for t in ts]; [t.join(180) for t in ts]
+    finally:
+        dl.LOCK_TIMEOUT_S, dl.STATEMENT_TIMEOUT_S = saved
     return out
 def hdr(i): return {"X-Forwarded-For": f"31.{i // 250}.{i % 250}.7"}
 reset(); o0 = n("calculator_otps"); slow_on()

@@ -97,9 +97,13 @@ def _hash(key: str) -> str:
     return hashlib.sha256(key.encode("utf8")).hexdigest()[:32]
 
 
+LOCK_TIMEOUT_S = 2           # a caller that cannot get its key's lock inside this refuses (fails closed); under a burst bigger than the database can serialise
+STATEMENT_TIMEOUT_S = 5      # in that time the tail of the queue is refused, which is the safe direction. Module constants so tests can widen them, never code.
+
+
 def _timeouts(cur) -> None:
-    cur.execute("SET LOCAL lock_timeout = '2s'")
-    cur.execute("SET LOCAL statement_timeout = '5s'")
+    cur.execute(f"SET LOCAL lock_timeout = '{int(LOCK_TIMEOUT_S)}s'")
+    cur.execute(f"SET LOCAL statement_timeout = '{int(STATEMENT_TIMEOUT_S)}s'")
 
 
 def ensure_table() -> None:
