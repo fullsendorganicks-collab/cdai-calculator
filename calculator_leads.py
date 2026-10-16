@@ -47,6 +47,9 @@ SUBJECT_MAX = 200
 TOO_MANY_DETAIL = "Too many requests. Please try again later."
 _EMAIL_RE = re.compile(r"[^@\s<>\",;()\[\]\\\x00-\x1f\x7f]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z][A-Za-z0-9-]{1,}")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Invisible / bidirectional formatting characters that can disguise a name in an e-mail client (right-to-left override, zero-width space, line and
+# paragraph separators, BOM). U+200C and U+200D are NOT here: they are legitimate in Persian and in emoji sequences.
+_HIDDEN_RE = re.compile("[\u200b\u200e\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069\ufeff]")
 _CODE_RE = re.compile(r"[0-9]{6}")
 
 
@@ -102,7 +105,7 @@ def _clean_text(raw: str, max_len: int, label: str) -> str:
     v = (raw or "").strip()
     if len(v) > max_len:
         raise HTTPException(status_code=400, detail=f"{label} too long")
-    if _CONTROL_RE.search(v) or not _encodable(v):
+    if _CONTROL_RE.search(v) or _HIDDEN_RE.search(v) or not _encodable(v):
         raise HTTPException(status_code=400, detail=f"{label} contains invalid characters")
     return v
 
@@ -293,14 +296,25 @@ def send_otp_email(name: str, email: str, code: str) -> bool:
         return False
 
 
+SENT, NOT_SENT, AMBIGUOUS = "sent", "not_sent", "ambiguous"
+
+
 def send_results_email(name: str, company: str, email: str,
                        results: dict, inputs: dict) -> bool:
-    """Send distortion results email via Resend."""
+    """Send distortion results email via Resend. True only when the send call returned."""
+    return deliver_results_email(name, company, email, results, inputs) == SENT
+
+
+def deliver_results_email(name: str, company: str, email: str,
+                          results: dict, inputs: dict) -> str:
+    """SENT: the send call returned. NOT_SENT: a DEFINITE failure before the send call (no API key, a rendering error): nothing can have been
+    delivered. AMBIGUOUS: the send call itself raised: Resend may have accepted the mail (timeout after accept), so the caller must not
+    treat it as undelivered."""
     try:
         import resend
         api_key = os.getenv("RESEND_API_KEY")
         if not api_key:
-            return False
+            return NOT_SENT
         resend.api_key = api_key
 
         reported_cpl = _num(results.get("reportedCpl", 0))
@@ -412,18 +426,22 @@ def send_results_email(name: str, company: str, email: str,
 </body>
 </html>"""
 
-        resend.Emails.send({
-            "from": "directives@alloceraintelligence.com",
-            "reply_to": "nick@alloceraintelligence.com",
-            "to": email,
-            "subject": subject,
-            "html": html,
-        })
+        try:
+            resend.Emails.send({
+                "from": "directives@alloceraintelligence.com",
+                "reply_to": "nick@alloceraintelligence.com",
+                "to": email,
+                "subject": subject,
+                "html": html,
+            })
+        except Exception as e:
+            logger.error("[CALC] Results email send call failed (outcome unknown): %s", type(e).__name__)
+            return AMBIGUOUS
         logger.info("[CALC] Results email sent")
-        return True
+        return SENT
     except Exception as e:
-        logger.error("[CALC] Results email failed: %s", type(e).__name__)
-        return False
+        logger.error("[CALC] Results email failed before sending: %s", type(e).__name__)
+        return NOT_SENT
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -555,17 +573,33 @@ def create_calculator_lead(payload: CalcLeadCreate,
         raise HTTPException(status_code=400, detail="Invalid or expired code")
 
     # Everything cheap and stateless is validated above. From here every attempt, right or wrong code, is consumed BEFORE the code lookup; durable, so a
-    # restart or a second worker cannot reset the guess budget. The service-wide verify ceiling bounds durable writes whatever the number of IPs.
+    # restart or a second worker cannot reset the guess budget.
     h_mailbox = durable_limits.hit(durable_limits.VERIFY_PER_MAILBOX, _cap_key(email))
     if h_mailbox is None:
         raise _too_many()
-    if durable_limits.hit(durable_limits.VERIFY_GLOBAL, durable_limits.GLOBAL_KEY) is None:
-        durable_limits.refund(h_mailbox)         # the ceiling refused, not this visitor's guessing
-        raise _too_many()
-
-    conn = get_conn()
-    cur  = conn.cursor()
+    reached_check = False
     try:
+        conn = get_conn()
+    except Exception as e:
+        durable_limits.refund(h_mailbox)         # nothing was checked: the visitor keeps the attempt
+        logger.error("[CALC] Failed to verify/create lead: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="Verification failed")
+    cur  = conn.cursor()
+    h_global = None
+    try:
+        # A mailbox with no live code cannot be verified whatever is guessed, so it must not spend the service-wide ceiling: spraying random
+        # mailboxes would otherwise lock real visitors out. Same answer as a wrong code.
+        cur.execute("SELECT 1 FROM calculator_otps WHERE email = %s AND verified = FALSE AND expires_at > NOW() LIMIT 1", (email,))
+        if cur.fetchone() is None:
+            reached_check = True
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+        # The service-wide verify ceiling bounds durable writes whatever the number of IPs.
+        h_global = durable_limits.hit(durable_limits.VERIFY_GLOBAL, durable_limits.GLOBAL_KEY)
+        if h_global is None:
+            durable_limits.refund(h_mailbox)     # the ceiling refused, not this visitor's guessing
+            reached_check = True
+            raise _too_many()
         # Verify the OTP
         cur.execute("""
             SELECT id FROM calculator_otps
@@ -577,15 +611,16 @@ def create_calculator_lead(payload: CalcLeadCreate,
             LIMIT 1
         """, (email, code))
         otp = cur.fetchone()
+        reached_check = True
 
         if not otp:
             raise HTTPException(status_code=400, detail="Invalid or expired code")
 
-        # Mark OTP as verified
-        cur.execute(
-            "UPDATE calculator_otps SET verified = TRUE WHERE id = %s",
-            (otp["id"],)
-        )
+        # Consume the code atomically: of two concurrent verifies with the same correct code only the one whose UPDATE flips verified gets a row.
+        cur.execute("UPDATE calculator_otps SET verified = TRUE WHERE id = %s AND verified = FALSE RETURNING id", (otp["id"],))
+        if cur.fetchone() is None:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
 
         # Create the lead row
         lead_id = str(uuid.uuid4())
@@ -613,7 +648,13 @@ def create_calculator_lead(payload: CalcLeadCreate,
     except HTTPException:
         raise
     except Exception as e:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if not reached_check:                    # a failure that never reached the code comparison must not cost the visitor an attempt
+            durable_limits.refund(h_mailbox)
+            durable_limits.refund(h_global)
         logger.error("[CALC] Failed to verify/create lead: %s", type(e).__name__)
         raise HTTPException(status_code=500, detail="Verification failed")
     finally:
@@ -684,18 +725,21 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
             h_claim = durable_limits.hit(durable_limits.RESULTS_CLAIM, lead_id)       # None: another save holds it (or the limiter is down): no mail
             if h_claim is not None:
                 h_mailbox = None
-                sent = False
+                outcome = NOT_SENT
                 try:
                     h_mailbox = durable_limits.hit(durable_limits.RESULTS_PER_MAILBOX, _cap_key(str(row["email"]).strip().lower()))
                     if h_mailbox is not None:
-                        sent = send_results_email(row["name"], row["company"], row["email"], r, i)
+                        outcome = AMBIGUOUS          # until the call below says otherwise: an interruption inside it is also "unknown"
+                        outcome = deliver_results_email(row["name"], row["company"], row["email"], r, i)
                 finally:
-                    if sent:
+                    if outcome == SENT:
                         _mark_sent(lead_id)          # the claim row stays: it blocks a second send for the hour even if this UPDATE failed
-                    else:
-                        # capped, failed or interrupted: nothing was delivered, give both allowances back so the next save can still deliver
+                    elif outcome == NOT_SENT:
+                        # capped, or a definite failure before the send call: nothing can have been delivered, give both allowances back
                         durable_limits.refund(h_mailbox)
                         durable_limits.refund(h_claim)
+                    # AMBIGUOUS: Resend may have accepted the mail. Keep the claim (blocks a re-send for an hour) and the mailbox hit (the 3 per
+                    # day cap still binds); email_sent stays FALSE.
 
         return {"status": "ok"}
 

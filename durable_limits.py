@@ -22,6 +22,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from typing import NamedTuple, Optional
 
 import psycopg2
@@ -47,6 +48,10 @@ _DDL = (
        )""",
     "CREATE INDEX IF NOT EXISTS calculator_rate_events_bucket_key_at ON calculator_rate_events (bucket, key, at)",
     "CREATE INDEX IF NOT EXISTS calculator_rate_events_at ON calculator_rate_events (at)",     # serves the purge
+    # (security statements follow in _DDL_SECURE)
+)
+
+_DDL_SECURE = (
     # Same posture as calculator_leads / otps / views in production: RLS on, no policies, no rights for the PostgREST roles.
     "ALTER TABLE calculator_rate_events ENABLE ROW LEVEL SECURITY",
     """DO $$
@@ -80,6 +85,9 @@ GLOBAL_KEY = "*"
 _ready = False
 _ready_lock = threading.Lock()
 _ddl_failure_logged = False
+_fail_until = 0.0              # negative cache: after a failed prepare, refuse instantly until this monotonic time
+NEGATIVE_CACHE_S = 10
+ENSURE_WAIT_S = 3             # how long a request waits for another thread that is preparing the table
 _calls = 0
 _calls_lock = threading.Lock()
 _purge_thread = None
@@ -106,37 +114,53 @@ def _timeouts(cur) -> None:
     cur.execute(f"SET LOCAL statement_timeout = '{int(STATEMENT_TIMEOUT_S)}s'")
 
 
+_PROBE = ("SELECT to_regclass('public.calculator_rate_events') IS NOT NULL AND "
+          "(SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'calculator_rate_events' AND indexname = ANY(%s)) = %s, "
+          "COALESCE((SELECT relrowsecurity FROM pg_class WHERE oid = to_regclass('public.calculator_rate_events')), false) AND "
+          "NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname IN ('anon', 'authenticated') AND to_regclass('public.calculator_rate_events') IS NOT NULL "
+          "AND has_table_privilege(r.rolname, 'public.calculator_rate_events', 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'))")
+
+
 def ensure_table() -> None:
-    """Make sure the table and both indexes exist, once per process. If they already exist NOTHING is run (so a role without CREATE works once the
-    table has been created). Raises TableUnavailable when it is missing and cannot be created."""
-    global _ready, _ddl_failure_logged
+    """Make sure the table, both indexes and the security posture exist, once per process. If all of it is already right NOTHING is run (so a role
+    without CREATE works once the table exists); if only the posture drifted (RLS off, rights granted) just the idempotent security statements
+    run. Raises TableUnavailable when it is missing and cannot be created. After a failure every caller is refused instantly for NEGATIVE_CACHE_S
+    and callers never queue behind a slow connect for longer than ENSURE_WAIT_S."""
+    global _ready, _ddl_failure_logged, _fail_until
     if _ready:
         return
-    with _ready_lock:
+    if time.monotonic() < _fail_until:
+        raise TableUnavailable()
+    if not _ready_lock.acquire(timeout=ENSURE_WAIT_S):
+        raise TableUnavailable()
+    try:
         if _ready:
             return
+        if time.monotonic() < _fail_until:        # another thread failed while we waited for the lock
+            raise TableUnavailable()
         try:
             conn = connect()
             try:
                 cur = conn.cursor()
                 _timeouts(cur)
-                cur.execute("SELECT to_regclass('public.calculator_rate_events') IS NOT NULL AND "
-                            "(SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'calculator_rate_events' AND indexname = ANY(%s)) = %s",
-                            (list(_INDEXES), len(_INDEXES)))
-                complete = cur.fetchone()[0]
-                if not complete:
+                cur.execute(_PROBE, (list(_INDEXES), len(_INDEXES)))
+                complete, secure = cur.fetchone()
+                if not complete or not secure:
                     cur.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK_ID,))   # CREATE ... IF NOT EXISTS can still race across workers
-                    for stmt in _DDL:
+                    for stmt in (_DDL if not complete else ()) + _DDL_SECURE:
                         cur.execute(stmt)
                 conn.commit()
                 _ready = True
             finally:
                 conn.close()
         except Exception as e:
+            _fail_until = time.monotonic() + NEGATIVE_CACHE_S
             if not _ddl_failure_logged:
                 _ddl_failure_logged = True
                 logger.error("[CALC] cannot prepare calculator_rate_events (%s); durable caps refuse every request until it exists", type(e).__name__)
             raise TableUnavailable() from e
+    finally:
+        _ready_lock.release()
 
 
 def purge() -> int:
@@ -162,6 +186,8 @@ def purge() -> int:
             total += n
             if n < PURGE_BATCH:
                 break
+    except psycopg2.errors.UndefinedTable:
+        pass                                    # not created yet: nothing to purge, nothing to report
     except Exception as e:
         logger.error("[CALC] rate-event purge failed: %s", type(e).__name__)
     return total

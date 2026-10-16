@@ -33,7 +33,7 @@ def start():
         subprocess.run(as_pg + list(a), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     pg(os.path.join(pg_bin, "initdb"), "-D", data, "-A", "trust", "-U", "cdai")
     pg(os.path.join(pg_bin, "pg_ctl"), "-D", data, "-w", "-l", os.path.join(tmp, "pg.log"),
-       "-o", f"-p {port} -k {tmp} -c listen_addresses='' -c max_connections=400", "start")
+       "-o", f"-p {port} -k {tmp} -c listen_addresses='' -c max_connections=1000", "start")
 
     def stop():
         try:

@@ -39,20 +39,34 @@ def _warn_once_if_shared(ip: str) -> None:
                    "'unknown'" if a is None else "a non-public address")
 
 
+def _hop_ip(hop: str):
+    """The address in one forwarded hop: bare IPv4, IPv4:port, bare IPv6, [IPv6], [IPv6]:port, with an optional IPv6 zone id (fe80::1%eth0).
+    Returns the normalised address text, or None if it does not parse."""
+    h = hop.strip()
+    if h.startswith("["):
+        end = h.find("]")
+        if end == -1:
+            return None
+        h = h[1:end]
+    elif h.count(":") == 1:
+        h = h.split(":", 1)[0]
+    a = _parse(h.split("%", 1)[0])
+    return None if a is None else str(a)
+
+
 def real_client_ip(request: Request) -> str:
     """Never for anything IP-allowlist-like.
 
     Render appends the true connecting IP as the LAST X-Forwarded-For entry and does not clear what the client sent, so every earlier entry is
-    attacker-controlled: only the last is used. The RAW header is read on purpose. `request.client.host` is NOT trusted: uvicorn's proxy-headers
-    handling (always-trust mode, as run on Render) rewrites it to the FIRST forwarded entry, which a visitor controls. client.host is only the
-    fallback when the header is absent, empty or its last hop is not an IP; then 'unknown'."""
-    ip = None
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        hops = [h.strip() for h in xff.split(",") if h.strip()]
-        if hops and _parse(hops[-1]) is not None:
-            ip = hops[-1]
-    if ip is None:
+    attacker-controlled: only the last is used. ALL header lines are joined (a second forged line must change nothing) and the RAW header is read
+    on purpose. `request.client.host` is NOT trusted when the header is present: uvicorn's proxy-headers handling (always-trust mode, as run on
+    Render) rewrites it to the FIRST forwarded entry, which a visitor controls. So: a header with hops decides alone (an unparseable last hop is
+    'unknown', one shared bucket, never a fall back to the forgeable host); client.host is used only when the header is absent or has no hops."""
+    lines = request.headers.getlist("x-forwarded-for")
+    hops = [h.strip() for line in lines for h in line.split(",") if h.strip()]
+    if hops:
+        ip = _hop_ip(hops[-1]) or "unknown"
+    else:
         ip = request.client.host if request.client else "unknown"
     _warn_once_if_shared(ip)
     return ip
@@ -62,7 +76,7 @@ def ip_bucket(ip: str) -> str:
     """Rate-limit key for an address: IPv4 as is, IPv6 reduced to its /64 (one subscriber can rotate addresses freely inside a /64,
     so a per-address cap would never bind). Anything that does not parse is returned unchanged."""
     try:
-        a = ipaddress.ip_address(ip)
+        a = ipaddress.ip_address(ip.split("%", 1)[0])
     except ValueError:
         return ip
     if a.version == 6:
