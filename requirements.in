@@ -1,0 +1,8 @@
+# Direct dependencies of the calculator service. To update: edit this file, resolve in a clean venv, run the tests, replace requirements.txt.
+fastapi
+uvicorn
+psycopg2-binary
+resend
+python-dotenv
+requests
+limits

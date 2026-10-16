@@ -4,7 +4,7 @@ Throwaway local PostgreSQL with the three production tables; Resend replaced by 
 unconfigured except where a test patches `requests.post`. Run from anywhere:  python tests/test_calculator_abuse_caps.py   (exit 1 on any FAIL)
 Limits are per process, so every section starts with rate_limits.reset().
 """
-import importlib.util, logging, os, re, subprocess, sys, time
+import importlib.util, logging, os, re, subprocess, sys, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -25,8 +25,19 @@ resend.Emails.send = _record            # the ONLY path to a mailbox in the code
 
 import calculator_leads as cl
 import rate_limits as rl
+import durable_limits as dl
 import client_ip
+import limits.storage.memory as lmem
 from main import app
+
+# Time travel for the in-memory limiter: limits reads time.time() in its storage module and rate_limits reads time in sweep/_maybe_sweep.
+_real_time = time
+class Clock:
+    off = 0.0
+    def time(self): return _real_time.time() + self.off
+    def monotonic(self): return _real_time.monotonic() + self.off
+    def __getattr__(self, name): return getattr(_real_time, name)
+clock = Clock(); lmem.time = clock; rl.time = clock
 
 http = TestClient(app)
 count, fails = [0], []
@@ -46,6 +57,11 @@ def db(sql, args=()):
 def n(table): return db(f"SELECT count(*) FROM {table}")[0][0]
 def reset():
     rl.reset(); SENT.clear()
+    db("DO $$ BEGIN IF to_regclass('calculator_rate_events') IS NOT NULL THEN DELETE FROM calculator_rate_events; END IF; END $$")
+def events(bucket=None):
+    return db("SELECT count(*) FROM calculator_rate_events" + (" WHERE bucket=%s" if bucket else ""), (bucket,) if bucket else ())[0][0]
+def backdate(bucket, seconds):
+    db("UPDATE calculator_rate_events SET at = at - make_interval(secs => %s) WHERE bucket=%s", (seconds, bucket))
 def send_code(email="a@example.com", name="Ann", company="Acme", addr=None):
     return http.post("/calculator-send-code", json={"name": name, "company": company, "email": email}, headers=H(addr))
 def verify(email="a@example.com", code="000000", addr=None, name="Ann", company="Acme", **kw):
@@ -63,6 +79,16 @@ def full_flow(email, **kw):
     assert send_code(email, **kw).status_code == 200
     r = verify(email, last_code(email), **kw); assert r.status_code == 200, r.text
     return r.json()["id"]
+
+print("-- 0. the durable table creates itself on first use (same pattern as calculator_views)")
+check(db("SELECT to_regclass('calculator_rate_events')")[0][0] is None, "table does not exist before the service first needs it")
+reset(); r = send_code("first@example.com", addr="1.1.1.1")
+check(r.status_code == 200 and db("SELECT to_regclass('calculator_rate_events')")[0][0] is not None, "first send-code creates calculator_rate_events")
+check(sorted(x[0] for x in db("SELECT indexname FROM pg_indexes WHERE tablename='calculator_rate_events'")) == ["calculator_rate_events_at", "calculator_rate_events_bucket_key_at", "calculator_rate_events_pkey"], "indexes (bucket,key,at) and (at) exist")
+check([x[0] for x in db("SELECT column_name FROM information_schema.columns WHERE table_name='calculator_rate_events' ORDER BY ordinal_position")] == ["id", "bucket", "key", "at"], "columns id, bucket, key, at")
+dl._ready = False
+check(dl.hit(dl.Cap("t", 1, 60), "k") is not None, "ensure_table is idempotent (second creation is harmless)")
+reset()
 
 print("-- 1. the normal flow is unchanged")
 reset()
@@ -377,12 +403,313 @@ before = len(SENT); patch(lead_d, addr=ip())
 check(before == 3 and len(SENT) == 3 and email_sent_flag(lead_d) is False, "results emails: four leads for one Gmail mailbox share the 3-per-day cap (the 4th is saved but not mailed)")
 
 print("-- 16. the configured limits (amount per window)")
-table = {"SEND_CODE_PER_IP": (5, 3600), "SEND_CODE_PER_EMAIL": (3, 3600), "VERIFY_PER_IP": (20, 600), "VERIFY_PER_EMAIL": (6, 600),
-         "VIEW_PER_IP": (60, 60), "UPDATE_PER_IP": (120, 60), "RESULTS_EMAIL_PER_ADDRESS": (3, 86400)}
+table = {"SEND_CODE_PER_IP": (5, 3600), "VERIFY_PER_IP": (20, 600), "VIEW_PER_IP": (60, 60), "UPDATE_PER_IP": (120, 60)}
 for k, (amt, win) in table.items():
-    lim = getattr(rl, k); check((lim.amount, lim.get_expiry()) == (amt, win), f"{k} = {amt} per {win} s")
+    lim = getattr(rl, k); check((lim.amount, lim.get_expiry()) == (amt, win), f"in-memory {k} = {amt} per {win} s")
+check(not any(hasattr(rl, k) for k in ("SEND_CODE_PER_EMAIL", "VERIFY_PER_EMAIL", "RESULTS_EMAIL_PER_ADDRESS")), "the in-memory per-mailbox limits are gone (no dead code)")
+dtable = {"SEND_CODE_PER_MAILBOX": ("code_mailbox", 3, 3600), "SEND_CODE_GLOBAL": ("global_code", 100, 3600), "VERIFY_PER_MAILBOX": ("verify_mailbox", 6, 600), "RESULTS_PER_MAILBOX": ("results_mailbox", 3, 86400)}
+for k, v in dtable.items(): check(tuple(getattr(dl, k)) == v, f"durable {k} = {v[1]} per {v[2]} s")
+check(dl.GLOBAL_KEY == "*" and dl.PURGE_AFTER == "2 days" and dl.PURGE_EVERY_CALLS == 100, "global key '*', purge after 2 days, every 100 calls")
 check((cl.NAME_MAX, cl.COMPANY_MAX, cl.EMAIL_MAX, cl.SESSION_ID_MAX, cl.JSON_MAX_CHARS, cl.SUBJECT_MAX) == (100, 200, 254, 100, 20000, 200), "size limits are 100/200/254/100/20000/200")
 check(cl.TOO_MANY_DETAIL == GENERIC, "the one refusal text")
+
+print("-- 18. client address: a public socket address wins and X-Forwarded-For is ignored")
+class R2:
+    def __init__(self, host, xff=None):
+        self.headers = {"x-forwarded-for": xff} if xff else {}
+        self.client = type("C", (), {"host": host})() if host else None
+rip = client_ip.real_client_ip
+check(rip(R2("8.8.8.8", "1.2.3.4, 5.6.7.8")) == "8.8.8.8", "public host: forged X-Forwarded-For changes nothing")
+check(rip(R2("8.8.8.8", "9.9.9.9")) == "8.8.8.8" and rip(R2("8.8.8.8")) == "8.8.8.8", "public host with or without the header")
+check(rip(R2("::ffff:8.8.8.8", "1.1.1.1")) == "8.8.8.8", "IPv4-mapped public host is the IPv4 address")
+check(rip(R2("2606:4700::1111", "1.1.1.1")) == "2606:4700::1111", "public IPv6 host used as is")
+for h in ("10.1.2.3", "172.16.0.9", "192.168.1.1", "127.0.0.1", "169.254.1.1", "0.0.0.0", "100.64.0.5", "::1", "fe80::1", "testclient"):
+    check(rip(R2(h, "7.7.7.7, 3.3.3.3")) == "3.3.3.3", f"non-public host {h}: last X-Forwarded-For hop is used")
+check(rip(R2("10.0.0.1", "3.3.3.3, not-an-ip")) == "10.0.0.1", "non-public host and a garbage last hop: falls back to the host")
+check(rip(R2(None, "garbage")) == "unknown" and rip(R2(None, "4.4.4.4")) == "4.4.4.4", "no host: 'unknown' for garbage, the hop when it parses")
+check(rip(R2("10.0.0.1")) == "10.0.0.1", "non-public host and no header: the host")
+pub = TestClient(app, client=("8.8.4.4", 5000)); pub2 = TestClient(app, client=("9.9.9.9", 5000))
+reset()
+codes = [pub.post("/calculator-send-code", json={"name": "A", "company": "B", "email": f"pc{i}@example.com"}, headers={"X-Forwarded-For": f"1.1.1.{i}"}).status_code for i in range(6)]
+check(codes == [200] * 5 + [429], f"end to end: six forged-header requests from one public socket address share one bucket (got {codes})")
+check(pub2.post("/calculator-send-code", json={"name": "A", "company": "B", "email": "pc9@example.com"}, headers={"X-Forwarded-For": "1.1.1.1"}).status_code == 200, "a different socket address is a different bucket whatever the header claims")
+reset(); v0 = n("calculator_views")
+for i in range(61): pub.post("/calculator-view", json={"session_id": "s"}, headers={"X-Forwarded-For": f"2.2.2.{i}"})
+check(n("calculator_views") - v0 == 60, "view cap also keyed by the socket address, not the header")
+
+print("-- 19. durable store: contract")
+reset()
+h1 = dl.allow("t_b", "k1", 2, 60); h2 = dl.allow("t_b", "k1", 2, 60); h3 = dl.allow("t_b", "k1", 2, 60)
+check(isinstance(h1, int) and isinstance(h2, int) and h1 != h2 and h3 is None, "2 allowed with row ids, the 3rd returns None")
+check(dl.allow("t_b", "k2", 2, 60) is not None and dl.allow("t_c", "k1", 2, 60) is not None, "other keys and other buckets are independent")
+check(events("t_b") == 3, "a refused hit is not recorded")
+check(dl.refund(h1) is True and events("t_b") == 2 and dl.allow("t_b", "k1", 2, 60) is not None, "refund deletes that hit and frees the slot")
+check(dl.refund(None) is False, "refund(None) is a no-op")
+check(not any("@" in (x[0] or "") for x in db("SELECT key FROM calculator_rate_events")) , "keys are stored hashed, never as an address")
+reset(); full_flow("hashchk@example.com")
+check(events() >= 2 and not any("hashchk" in x[0] for x in db("SELECT key FROM calculator_rate_events")), "real traffic stores no address in calculator_rate_events")
+
+print("-- 20. durable store fails closed")
+reset(); real_connect = dl.connect
+def down(): raise psycopg2.OperationalError("db down for hashchk@example.com")
+dl.connect = down
+check(dl.allow("x", "y", 5, 60) is None, "database error: allow() returns None (over cap)")
+o0 = n("calculator_otps"); SENT.clear()
+r = send_code("fail1@example.com", addr=ip())
+check(r.status_code == 429 and n("calculator_otps") == o0 and not SENT, "send-code: 429, no OTP row, no mail")
+check(verify("fail1@example.com", "123456", addr=ip()).status_code == 429, "verify: 429 (the guess is not even looked up)")
+dl.connect = real_connect
+lead = new_lead("fail2@example.com"); SENT.clear(); dl.connect = down
+check(patch(lead, addr=ip()).status_code == 200 and not SENT and email_sent_flag(lead) is False, "results mail: no mail, lead saved, claim released")
+dl.connect = real_connect
+patch(lead, addr=ip()); check(len(SENT) == 1 and email_sent_flag(lead) is True, "after the database is back the same lead is mailed")
+dl._ready = False; dl.connect = down; check(dl.hit(dl.SEND_CODE_GLOBAL, "*") is None, "table creation failure is also closed"); dl.connect = real_connect
+reset()
+
+print("-- 21. a failed send gives the allowance back")
+reset(); o0 = n("calculator_otps")
+def failing_send(params): raise RuntimeError("resend down")
+resend.Emails.send = failing_send
+r = send_code("refund@example.com", addr=ip())
+check(r.status_code == 500 and n("calculator_otps") == o0, "failed OTP mail: 500 and the OTP row is deleted")
+check(events("code_mailbox") == 0 and events("global_code") == 0, "both the mailbox and the global hit are refunded")
+resend.Emails.send = _record
+check([send_code("refund@example.com", addr=ip()).status_code for _ in range(3)] == [200, 200, 200], "the visitor still has all 3 attempts afterwards")
+reset(); lead = new_lead("refund2@example.com"); resend.Emails.send = failing_send
+patch(lead, addr=ip())
+check(events("results_mailbox") == 0 and email_sent_flag(lead) is False, "failed results mail: hit refunded and email_sent back to FALSE")
+resend.Emails.send = _record; SENT.clear(); patch(lead, addr=ip())
+check(len(SENT) == 1 and email_sent_flag(lead) is True, "the next save delivers it")
+reset()
+for _ in range(100): dl.hit(dl.SEND_CODE_GLOBAL, dl.GLOBAL_KEY)
+o0 = n("calculator_otps"); SENT.clear()
+r = send_code("pausechk@example.com", addr=ip())
+check(r.status_code == 429 and r.json() == {"detail": GENERIC} and n("calculator_otps") == o0 and not SENT, "global ceiling reached: 429, generic text, no OTP row, no mail")
+check(events("code_mailbox") == 0, "the refused visitor's per-mailbox hit was refunded")
+reset()
+
+print("-- 22. time travel: N allowed, N+1 refused, allowed again after the window (in-memory caps)")
+def sc(i, addr): return send_code(f"tt{i}@example.com", addr=addr).status_code
+reset(); A = "21.0.0.1"
+check([sc(i, A) for i in range(6)] == [200] * 5 + [429], "send-code per IP: 5 allowed, 6th refused")
+clock.off += 3599; check(sc(7, A) == 429, "send-code per IP: still refused 1 s before the hour is up")
+clock.off += 2; check(sc(8, A) == 200, "send-code per IP: allowed again after the hour")
+reset(); A = "21.0.0.2"
+check([verify(f"vt{i}@example.com", addr=A).status_code for i in range(21)] == [400] * 20 + [429], "verify per IP: 20 allowed, 21st refused")
+clock.off += 599; check(verify("vt99@example.com", addr=A).status_code == 429, "verify per IP: refused just inside 10 minutes")
+clock.off += 2; check(verify("vt99@example.com", addr=A).status_code == 400, "verify per IP: allowed again after 10 minutes")
+reset(); A = "21.0.0.3"; v0 = n("calculator_views")
+for i in range(61): http.post("/calculator-view", json={"session_id": "t"}, headers=H(A))
+check(n("calculator_views") - v0 == 60, "view per IP: 60 stored, 61st not")
+clock.off += 61; http.post("/calculator-view", json={"session_id": "t"}, headers=H(A))
+check(n("calculator_views") - v0 == 61, "view per IP: stored again after a minute")
+reset(); A = "21.0.0.4"; lead = new_lead("ttp@example.com")
+check([patch(lead, addr=A, inputs={"adSpend": 0}).status_code for _ in range(121)][-2:] == [200, 429], "PATCH per IP: 120th allowed, 121st refused")
+clock.off += 61; check(patch(lead, addr=A, inputs={"adSpend": 0}).status_code == 200, "PATCH per IP: allowed again after a minute")
+reset()
+
+print("-- 23. time travel: durable caps (rows back-dated in SQL)")
+reset(); mb = "dur@example.com"
+check([send_code(mb, addr=ip()).status_code for _ in range(4)] == [200, 200, 200, 429], "send-code per mailbox: 3 allowed, 4th refused")
+backdate("code_mailbox", 3595); check(send_code(mb, addr=ip()).status_code == 429, "send-code per mailbox: still refused inside the hour")
+backdate("code_mailbox", 10); check(send_code(mb, addr=ip()).status_code == 200, "send-code per mailbox: allowed again after the hour")
+reset()
+for _ in range(100): dl.hit(dl.SEND_CODE_GLOBAL, dl.GLOBAL_KEY)
+backdate("global_code", 3595); check(send_code("g1@example.com", addr=ip()).status_code == 429, "global: still refused inside the hour")
+backdate("global_code", 10); check(send_code("g1@example.com", addr=ip()).status_code == 200, "global: allowed again after the hour")
+reset()
+for _ in range(99): dl.hit(dl.SEND_CODE_GLOBAL, dl.GLOBAL_KEY)
+check(send_code("g2@example.com", addr=ip()).status_code == 200 and send_code("g3@example.com", addr=ip()).status_code == 429, "global: the 100th request is allowed, the 101st refused")
+reset(); send_code("vm@example.com", addr=ip())
+check([verify("vm@example.com", "000000", addr=ip()).status_code for _ in range(7)][-2:] == [400, 429], "verify per mailbox: 6th reaches the lookup, 7th refused")
+backdate("verify_mailbox", 595); check(verify("vm@example.com", "000000", addr=ip()).status_code == 429, "verify per mailbox: refused inside 10 minutes")
+backdate("verify_mailbox", 10); check(verify("vm@example.com", "000000", addr=ip()).status_code == 400, "verify per mailbox: allowed again after 10 minutes")
+reset(); SENT.clear(); ls = [new_lead("day@example.com") for _ in range(4)]
+for L in ls: patch(L, addr=ip())
+check(len(SENT) == 3 and email_sent_flag(ls[3]) is False, "results per mailbox: 3 mailed, 4th not")
+backdate("results_mailbox", 86000); patch(ls[3], addr=ip()); check(len(SENT) == 3, "results per mailbox: still refused inside the day")
+backdate("results_mailbox", 500); patch(ls[3], addr=ip()); check(len(SENT) == 4 and email_sent_flag(ls[3]) is True, "results per mailbox: the 4th lead is mailed once the day has passed")
+reset()
+for age, label in ((3600, "1h"), (86400, "1d"), (172000, "1.99d"), (173000, "2.002d"), (300000, "3.5d")):
+    db("INSERT INTO calculator_rate_events (bucket, key, at) VALUES ('purge', %s, now() - make_interval(secs => %s))", (label, age))
+check(dl.purge() == 2 and sorted(x[0] for x in db("SELECT key FROM calculator_rate_events WHERE bucket='purge'")) == ["1.99d", "1d", "1h"], "purge removes only rows older than 2 days")
+db("INSERT INTO calculator_rate_events (bucket, key, at) VALUES ('purge', 'old', now() - interval '5 days')")
+dl._calls = dl.PURGE_EVERY_CALLS - 1; dl.allow("p2", "k", 5, 60)
+check(db("SELECT count(*) FROM calculator_rate_events WHERE key='old'")[0][0] == 0 and events("purge") == 3, "the 100th call purges opportunistically and keeps recent rows")
+dl._calls = 0; db("INSERT INTO calculator_rate_events (bucket, key, at) VALUES ('purge', 'old2', now() - interval '5 days')"); dl.allow("p2", "k", 5, 60)
+check(db("SELECT count(*) FROM calculator_rate_events WHERE key='old2'")[0][0] == 1, "ordinary calls do not purge")
+reset()
+
+print("-- 24. concurrency")
+class SlowCursor:
+    """Cursor proxy that pauses after the durable limiter's COUNT, so a missing lock would let every concurrent caller see an empty count."""
+    def __init__(self, cur): self._c = cur
+    def execute(self, sql, *a):
+        r = self._c.execute(sql, *a)
+        if sql.lstrip().startswith("SELECT count(*) FROM calculator_rate_events"): time.sleep(0.03)
+        return r
+    def __getattr__(self, n): return getattr(self._c, n)
+class SlowConn:
+    def __init__(self, c): self._conn = c
+    def cursor(self, *a, **k): return SlowCursor(self._conn.cursor(*a, **k))
+    def __getattr__(self, n): return getattr(self._conn, n)
+_real_dl_connect = dl.connect
+def slow_on(): dl.connect = lambda: SlowConn(_real_dl_connect())
+def slow_off(): dl.connect = _real_dl_connect
+def burst(n_threads, fn):
+    barrier = threading.Barrier(n_threads); out = [None] * n_threads
+    def run(i):
+        c = TestClient(app); barrier.wait(); out[i] = fn(c, i)
+    ts = [threading.Thread(target=run, args=(i,)) for i in range(n_threads)]
+    [t.start() for t in ts]; [t.join(120) for t in ts]
+    return out
+def hdr(i): return {"X-Forwarded-For": f"31.{i // 250}.{i % 250}.7"}
+reset(); o0 = n("calculator_otps"); slow_on()
+res = burst(20, lambda c, i: c.post("/calculator-send-code", json={"name": "A", "company": "B", "email": "burst@example.com"}, headers=hdr(i)).status_code)
+check(sorted(res).count(200) == 3 and res.count(429) == 17, f"20 concurrent send-codes for one mailbox: exactly 3 allowed (got {res.count(200)} / {res.count(429)})")
+slow_off()
+check(n("calculator_otps") - o0 == 3 and len(SENT) == 3 and events("code_mailbox") == 3, "exactly 3 OTP rows, 3 mails, 3 recorded hits")
+reset(); send_code("vburst@example.com", addr=ip()); good = last_code("vburst@example.com"); wrong = "000000" if good != "000000" else "000001"; slow_on()
+res = burst(20, lambda c, i: c.post("/calculator-lead", json={"name": "A", "company": "B", "email": "vburst@example.com", "code": wrong}, headers=hdr(i)).status_code)
+slow_off()
+check(res.count(400) == 6 and res.count(429) == 14, f"20 concurrent verify attempts: exactly 6 reach the code lookup (got {res.count(400)} / {res.count(429)})")
+reset(); o0 = n("calculator_otps"); slow_on()
+res = burst(120, lambda c, i: c.post("/calculator-send-code", json={"name": "A", "company": "B", "email": f"gb{i}@example.com"}, headers=hdr(i)).status_code)
+slow_off()
+check(res.count(200) == 100 and res.count(429) == 20, f"120 concurrent requests: exactly 100 allowed by the global ceiling (got {res.count(200)} / {res.count(429)})")
+check(n("calculator_otps") - o0 == 100 and len(SENT) == 100 and events("global_code") == 100, "exactly 100 OTP rows, mails and recorded hits")
+reset(); lead = new_lead("race@example.com")
+def slow(params): time.sleep(0.3); SENT.append(params); return {"id": "x"}
+resend.Emails.send = slow; slow_on()
+res = burst(8, lambda c, i: c.patch(f"/calculator-lead/{lead}", json={"results": GOOD_R, "inputs": GOOD_I}, headers=hdr(i)).status_code)
+resend.Emails.send = _record; slow_off()
+check(res == [200] * 8 and len(SENT) == 1 and email_sent_flag(lead) is True and events("results_mailbox") == 1, "8 truly concurrent saves of one lead: exactly one mail, one recorded hit")
+reset(); ls = [new_lead("rburst@example.com") for _ in range(10)]; slow_on()
+res = burst(10, lambda c, i: c.patch(f"/calculator-lead/{ls[i]}", json={"results": GOOD_R, "inputs": GOOD_I}, headers=hdr(i)).status_code)
+slow_off()
+check(len(SENT) == 3 and sum(1 for L in ls if email_sent_flag(L)) == 3, "10 concurrent leads of one mailbox: exactly 3 mails, the rest released")
+reset()
+
+print("-- 25. PATCH with junk numbers never fails")
+junk = ['"100"', "null", "true", "NaN", "Infinity", "-Infinity", str(10 ** 400), "[1]", '{"a":1}', "-5", "0", "1e999"]
+lead = new_lead("junk@example.com"); SENT.clear(); bad = []
+for field in ("adSpend", "leads", "trueCpl"):
+    for jv in junk:
+        i_ = {"adSpend": 1000, "leads": 10}; r_ = {"trueCpl": 5}
+        (r_ if field == "trueCpl" else i_)[field] = "@@"
+        body = json_body = '{"inputs":%s,"results":%s}' % (str(i_).replace("'", '"'), str(r_).replace("'", '"'))
+        body = body.replace('"@@"', jv)
+        resp = http.patch(f"/calculator-lead/{lead}", content=body, headers={**H(), "Content-Type": "application/json"})
+        if resp.status_code != 200 or SENT: bad.append((field, jv, resp.status_code, len(SENT)))
+check(not bad, f"36 junk-number combinations: always 200 and never a mail (failures: {bad[:3]})")
+check(email_sent_flag(lead) is False, "and no claim is left behind")
+check(db("SELECT inputs::text FROM calculator_leads WHERE id=%s", (lead,)) != [(None,)], "NaN/Infinity were stored as null, not rejected by jsonb")
+check([cl._num(x) for x in ("1", None, True, False, float("nan"), float("inf"), 10 ** 400, [1], {}, 7, 2.5, -1e308)] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 2.5, -1e308], "_num: finite numbers pass, everything else is 0")
+for fld in ("reportedCpl", "trueCpl", "hiddenCosts", "cmPct", "cplGapPct"):
+    for junk_v in ("x", None, [1], {"a": 1}):
+        SENT.clear(); good_r = dict(GOOD_R); good_r[fld] = junk_v
+        got = cl.send_results_email("N", "Co", "r@example.com", good_r, GOOD_I)
+        if got is not True or len(SENT) != 1: bad.append((fld, junk_v))
+check(not bad, f"send_results_email: junk in any single numeric field still produces the mail (failures: {bad[:3]})")
+SENT.clear()
+ok = cl.send_results_email("N", "Co", "r@example.com", {"reportedCpl": "x", "trueCpl": None, "hiddenCosts": True, "cmPct": float("nan"), "cplGapPct": 10 ** 400}, {})
+check(ok is True and len(SENT) == 1, "send_results_email coerces every number it formats (junk results still produce a mail)")
+SENT.clear(); r = http.patch(f"/calculator-lead/{lead}", json={"inputs": {"adSpend": 1e308, "leads": 1e308}, "results": {"trueCpl": 1e308, "reportedCpl": -1e308, "hiddenCosts": 1e308}}, headers=H())
+check(r.status_code == 200 and len(SENT) == 1, "huge finite numbers are meaningful data and still format without an error")
+
+print("-- 26. request body cap before parsing")
+reset(); lead = new_lead("body@example.com"); before = db("SELECT inputs, results FROM calculator_leads WHERE id=%s", (lead,))
+ORIGIN = {"Origin": "https://alloceraintelligence.com"}
+big = b'{"inputs":{"k":"' + b"v" * 70000 + b'"}}'
+r = http.patch(f"/calculator-lead/{lead}", content=big, headers={**H(), **ORIGIN, "Content-Type": "application/json"})
+check(r.status_code == 413 and r.json() == {"detail": "Request body too large"}, "declared Content-Length over 65536: 413")
+check(r.headers.get("access-control-allow-origin") == "https://alloceraintelligence.com", "the 413 carries the CORS header")
+def chunks(total, size=8192):
+    sent_ = 0
+    while sent_ < total:
+        piece = min(size, total - sent_); sent_ += piece; yield b" " * piece
+r = http.patch(f"/calculator-lead/{lead}", content=chunks(200000), headers={**H(), **ORIGIN, "Content-Type": "application/json"})
+check(r.status_code == 413 and r.headers.get("access-control-allow-origin") == "https://alloceraintelligence.com", "streamed body with no Content-Length over the limit: 413 with CORS header")
+check(db("SELECT inputs, results FROM calculator_leads WHERE id=%s", (lead,)) == before, "neither wrote anything")
+def padded(total):
+    core = b'{"inputs":{"adSpend":0}}'; return core + b" " * (total - len(core))
+r = http.patch(f"/calculator-lead/{lead}", content=padded(65536), headers={**H(), "Content-Type": "application/json"})
+check(r.status_code == 200, f"a body of exactly 65536 bytes passes (got {r.status_code})")
+r = http.patch(f"/calculator-lead/{lead}", content=padded(65537), headers={**H(), "Content-Type": "application/json"})
+check(r.status_code == 413, "65537 bytes is refused")
+r = http.patch(f"/calculator-lead/{lead}", content=(chunks(65536)), headers={**H(), "Content-Type": "application/json"})
+check(r.status_code != 413, "a streamed body of exactly 65536 bytes is not cut off")
+r = http.patch(f"/calculator-lead/{lead}", content=chunks(65537), headers={**H(), "Content-Type": "application/json"})
+check(r.status_code == 413, "a streamed body of 65537 bytes is cut off")
+r = http.post("/calculator-send-code", content=b"x" * 70000, headers={**H(), "Content-Type": "application/json"})
+check(r.status_code == 413, "the cap covers every endpoint")
+check(http.get("/health").json() == {"status": "ok", "service": "cdai-calculator"}, "GET /health is untouched")
+deep = '{"a":' * 9000 + "1" + "}" * 9000
+before = db("SELECT inputs, results FROM calculator_leads WHERE id=%s", (lead,)); t0 = time.time(); quiet = TestClient(app, raise_server_exceptions=False)
+r = quiet.patch(f"/calculator-lead/{lead}", content='{"inputs":' + deep + "}", headers={**H(), "Content-Type": "application/json"})
+check(len(deep) < 65536 and 400 <= r.status_code < 600 and time.time() - t0 < 10 and db("SELECT inputs, results FROM calculator_leads WHERE id=%s", (lead,)) == before, f"deep nesting under the limit answers {r.status_code} quickly and writes nothing")
+reset()
+
+print("-- 27. body cap middleware, driven directly (no HTTP stack in between)")
+import asyncio
+from main import BodyLimitMiddleware, MAX_BODY_BYTES
+check(MAX_BODY_BYTES == 65536, "limit is 65536 bytes")
+def drive(app_fn, headers, chunks, scope_type="http"):
+    """Run the middleware around app_fn; returns (status or None, bytes the app received, app_called)."""
+    state = {"called": False, "got": 0, "status": None, "pulled": 0}
+    async def inner(scope, receive, send):
+        state["called"] = True
+        await app_fn(scope, receive, send, state)
+    mw = BodyLimitMiddleware(inner)
+    queue = list(chunks)
+    async def receive():
+        state["pulled"] += 1
+        if queue: return {"type": "http.request", "body": queue.pop(0), "more_body": bool(queue)}
+        await asyncio.sleep(0.01); return {"type": "http.disconnect"}
+    async def send(msg):
+        if msg["type"] == "http.response.start": state["status"] = msg["status"]
+    asyncio.run(mw({"type": scope_type, "headers": headers}, receive, send))
+    return state
+async def reader_app(scope, receive, send, st):
+    while True:
+        m = await receive()
+        if m["type"] == "http.request":
+            st["got"] += len(m["body"])
+            if not m.get("more_body"): break
+        else: break
+    await send({"type": "http.response.start", "status": 200, "headers": []}); await send({"type": "http.response.body", "body": b"ok"})
+st = drive(reader_app, [(b"content-length", b"70000")], [b"x" * 70000])
+check(st["status"] == 413 and not st["called"] and st["pulled"] == 0, "declared Content-Length over the limit: 413 without running the app or reading a byte")
+st = drive(reader_app, [(b"content-length", b"abc")], [b"x"])
+check(st["status"] == 413 and not st["called"], "an unparseable Content-Length is refused")
+st = drive(reader_app, [], [b"x" * 30000] * 3)
+check(st["status"] == 413 and st["got"] <= MAX_BODY_BYTES, f"chunked body over the limit: 413 and the app never received more than the limit ({st['got']} bytes)")
+st = drive(reader_app, [(b"content-length", b"10")], [b"x" * 30000] * 3)
+check(st["status"] == 413 and st["got"] <= MAX_BODY_BYTES, "a lying Content-Length does not help")
+st = drive(reader_app, [], [b"x" * 32768, b"y" * 32768])
+check(st["status"] == 200 and st["got"] == 65536, "exactly 65536 bytes streamed passes")
+st = drive(reader_app, [(b"content-length", b"65536")], [b"x" * 65536])
+check(st["status"] == 200, "declared 65536 passes")
+st = drive(reader_app, [], [b"x" * 32768, b"y" * 32769])
+check(st["status"] == 413, "65537 bytes streamed is refused")
+async def silent_app(scope, receive, send, st):
+    while (await receive())["type"] == "http.request": pass
+st = drive(silent_app, [], [b"x" * 30000] * 3)
+check(st["status"] == 413, "an app that returns without answering after an overflow still yields a 413")
+async def crashing_app(scope, receive, send, st):
+    while (await receive())["type"] == "http.request": pass
+    raise RuntimeError("parser blew up")
+st = drive(crashing_app, [], [b"x" * 30000] * 3)
+check(st["status"] == 413, "an app that crashes after an overflow still yields a 413")
+async def answering_app(scope, receive, send, st):
+    while (await receive())["type"] == "http.request": pass
+    await send({"type": "http.response.start", "status": 422, "headers": []}); await send({"type": "http.response.body", "body": b"parse error"})
+st = drive(answering_app, [], [b"x" * 30000] * 3)
+check(st["status"] == 413, "the app's own error answer is replaced by the 413")
+st = drive(reader_app, [], [], scope_type="lifespan")
+check(st["called"], "non-HTTP scopes pass straight through")
+st = drive(reader_app, [(b"content-length", b"70000")], [], scope_type="websocket")
+check(st["called"] and st["status"] != 413, "a non-HTTP scope is never answered with an HTTP 413, whatever headers it carries")
 
 print("-- 17. nothing else moved")
 ops = sorted((p_, m) for p_, d in app.openapi()["paths"].items() for m in d)

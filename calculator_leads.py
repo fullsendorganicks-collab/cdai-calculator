@@ -13,6 +13,7 @@ lead_events, cost_events, etc).
 
 import os
 import json
+import math
 import re
 import uuid
 import secrets
@@ -26,6 +27,7 @@ from psycopg2.extras import RealDictCursor
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+import durable_limits
 import rate_limits
 from client_ip import real_client_ip, ip_bucket
 
@@ -96,15 +98,29 @@ def _clean_text(raw: str, max_len: int, label: str) -> str:
     return v
 
 
-def _check_json_size(v: Optional[dict], label: str) -> None:
-    if v is None:
-        return
+def _json_text(v: Optional[dict], label: str) -> str:
+    """The JSON text to store for inputs/results: size-capped (413), always valid for Postgres jsonb. Non-finite numbers (NaN, Infinity), which
+    Python accepts from a client but jsonb rejects, are stored as null. Unserialisable or pathologically nested values are 400."""
+    if not v:
+        return "{}"
     try:
-        size = len(json.dumps(v))
+        text = json.dumps(json.loads(json.dumps(v), parse_constant=lambda _c: None))
     except (TypeError, ValueError, RecursionError):
         raise HTTPException(status_code=400, detail=f"{label} not valid")
-    if size > JSON_MAX_CHARS:
+    if len(text) > JSON_MAX_CHARS:
         raise HTTPException(status_code=413, detail=f"{label} too large")
+    return text
+
+
+def _num(v) -> float:
+    """A finite real number, else 0. Strings, None, booleans, NaN/Infinity and ints too large for a float are all 'no number' (0), so a hostile or
+    sloppy client can never make an arithmetic comparison or a format call raise."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    try:
+        return v if math.isfinite(v) else 0
+    except OverflowError:
+        return 0
 
 
 def get_conn():
@@ -267,11 +283,11 @@ def send_results_email(name: str, company: str, email: str,
             return False
         resend.api_key = api_key
 
-        reported_cpl = results.get("reportedCpl", 0)
-        true_cpl     = results.get("trueCpl", 0)
-        hidden_costs = results.get("hiddenCosts", 0)
-        cm_pct       = results.get("cmPct", 0)
-        cpl_gap_pct  = results.get("cplGapPct", 0)
+        reported_cpl = _num(results.get("reportedCpl", 0))
+        true_cpl     = _num(results.get("trueCpl", 0))
+        hidden_costs = _num(results.get("hiddenCosts", 0))
+        cm_pct       = _num(results.get("cmPct", 0))
+        cpl_gap_pct  = _num(results.get("cplGapPct", 0))
 
         cm_color = "#0BAF92" if cm_pct >= 0 else "#D63050"
         cm_sign  = "+" if cm_pct >= 0 else ""
@@ -430,18 +446,45 @@ def send_code(payload: SendCodeRequest,
     """
     Step 1 — gate. Generate a 6-digit OTP, store it, email it.
     Nothing is saved to calculator_leads until the code is verified.
-    Caps: per IP bucket (dependency, consumed on every attempt) and per normalised address.
+    Caps (nothing is stored or sent when one refuses): per IP bucket (in memory, a dependency consumed on every attempt), then per mailbox
+    (3/hour) and one service-wide ceiling (100 OTP mails/hour), both durable in PostgreSQL. A send that fails gives its allowance back.
     """
     email   = _clean_email(payload.email)
     name    = _clean_text(payload.name, NAME_MAX, "Name")
     company = _clean_text(payload.company, COMPANY_MAX, "Company")
 
-    if not rate_limits.allow(rate_limits.SEND_CODE_PER_EMAIL, _cap_key(email), "calc_code_email"):
+    h_mailbox = durable_limits.hit(durable_limits.SEND_CODE_PER_MAILBOX, _cap_key(email))
+    if h_mailbox is None:
         raise _too_many()
+    h_global = durable_limits.hit(durable_limits.SEND_CODE_GLOBAL, durable_limits.GLOBAL_KEY)
+    if h_global is None:
+        durable_limits.refund(h_mailbox)         # the visitor did nothing wrong: the service ceiling is what refused
+        raise _too_many()
+
+    def give_back(otp_id=None):
+        """The code was not delivered: remove its row and return both allowances."""
+        if otp_id is not None:
+            try:
+                c = get_conn()
+                try:
+                    c.cursor().execute("DELETE FROM calculator_otps WHERE id = %s", (otp_id,))
+                    c.commit()
+                finally:
+                    c.close()
+            except Exception as e:
+                logger.error("[CALC] Failed to remove undelivered OTP: %s", type(e).__name__)
+        durable_limits.refund(h_mailbox)
+        durable_limits.refund(h_global)
 
     code = f"{secrets.randbelow(10**6):06d}"
 
-    conn = get_conn()
+    otp_id = None
+    try:
+        conn = get_conn()
+    except Exception as e:
+        give_back()
+        logger.error("[CALC] Failed to store OTP: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to send code")
     cur  = conn.cursor()
     try:
         # Note: previously this deleted prior unverified codes for this email
@@ -452,10 +495,13 @@ def send_code(payload: SendCodeRequest,
         cur.execute("""
             INSERT INTO calculator_otps (email, name, company, code, expires_at)
             VALUES (%s, %s, %s, %s, NOW() + INTERVAL '10 minutes')
+            RETURNING id
         """, (email, name, company, code))
+        otp_id = cur.fetchone()["id"]
         conn.commit()
     except Exception as e:
         conn.rollback()
+        give_back()
         logger.error("[CALC] Failed to store OTP: %s", type(e).__name__)
         raise HTTPException(status_code=500, detail="Failed to send code")
     finally:
@@ -463,6 +509,7 @@ def send_code(payload: SendCodeRequest,
 
     sent = send_otp_email(name, email, code)
     if not sent:
+        give_back(otp_id)
         raise HTTPException(status_code=500, detail="Failed to send code email")
 
     return {"status": "sent"}
@@ -479,10 +526,11 @@ def create_calculator_lead(payload: CalcLeadCreate,
     email   = _clean_email(payload.email)
     name    = _clean_text(payload.name, NAME_MAX, "Name")
     company = _clean_text(payload.company, COMPANY_MAX, "Company")
-    _check_json_size(payload.inputs, "inputs")
-    _check_json_size(payload.results, "results")
+    inputs_json  = _json_text(payload.inputs, "inputs")
+    results_json = _json_text(payload.results, "results")
 
-    if not rate_limits.allow(rate_limits.VERIFY_PER_EMAIL, _cap_key(email), "calc_verify_email"):
+    # Consumed on every attempt, right or wrong code, BEFORE the code lookup; durable, so a restart or a second worker cannot reset the guess budget.
+    if durable_limits.hit(durable_limits.VERIFY_PER_MAILBOX, _cap_key(email)) is None:
         raise _too_many()
 
     code = (payload.code or "").strip()
@@ -526,8 +574,8 @@ def create_calculator_lead(payload: CalcLeadCreate,
             name,
             company,
             email,
-            json.dumps(payload.inputs or {}),
-            json.dumps(payload.results or {}),
+            inputs_json,
+            results_json,
         ))
         conn.commit()
         logger.info("[CALC] Verified + lead created: %s", lead_id)
@@ -560,22 +608,19 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
         uuid.UUID(lead_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    _check_json_size(payload.inputs, "inputs")
-    _check_json_size(payload.results, "results")
+    inputs_json  = _json_text(payload.inputs, "inputs")
+    results_json = _json_text(payload.results, "results")
 
     conn = get_conn()
     cur  = conn.cursor()
+    claimed = False
     try:
         cur.execute("""
             UPDATE calculator_leads
             SET inputs = %s, results = %s, updated_at = NOW()
             WHERE id = %s
-            RETURNING name, company, email, email_sent
-        """, (
-            json.dumps(payload.inputs or {}),
-            json.dumps(payload.results or {}),
-            lead_id,
-        ))
+            RETURNING name, company, email
+        """, (inputs_json, results_json, lead_id))
         row = cur.fetchone()
         conn.commit()
 
@@ -585,28 +630,34 @@ def update_calculator_lead(lead_id: str, payload: CalcLeadUpdate,
         r = payload.results or {}
         i = payload.inputs or {}
 
-        # Send results email once when there's real data.
-        # Email is already verified so no spend/lead minimums needed.
-        should_email = (
-            not row["email_sent"]
-            and i.get("adSpend", 0) > 0
-            and i.get("leads", 0) > 0
-            and r.get("trueCpl", 0) > 0
+        # Send the results email once, when there's real data. Email is already verified so no other threshold is needed.
+        # Anything that is not a finite number counts as 0 (never raises): a lead with junk numbers is saved and simply gets no mail.
+        meaningful = (
+            _num(i.get("adSpend", 0)) > 0
+            and _num(i.get("leads", 0)) > 0
+            and _num(r.get("trueCpl", 0)) > 0
         )
 
-        if should_email and rate_limits.allow(
-                rate_limits.RESULTS_EMAIL_PER_ADDRESS,
-                _cap_key(str(row["email"]).strip().lower()), "calc_results_email"):
-            sent = send_results_email(
-                row["name"], row["company"], row["email"], r, i
-            )
-            if sent:
-                cur2 = conn.cursor()
-                cur2.execute(
-                    "UPDATE calculator_leads SET email_sent = TRUE WHERE id = %s",
-                    (lead_id,)
-                )
-                conn.commit()
+        if meaningful:
+            # Atomic claim: only the request whose UPDATE flips email_sent FALSE -> TRUE may send, so two concurrent saves can never both send.
+            cur.execute("UPDATE calculator_leads SET email_sent = TRUE WHERE id = %s AND email_sent = FALSE RETURNING id", (lead_id,))
+            claimed = cur.fetchone() is not None
+            conn.commit()
+
+        if claimed:
+            sent = False
+            h = None
+            try:
+                h = durable_limits.hit(durable_limits.RESULTS_PER_MAILBOX, _cap_key(str(row["email"]).strip().lower()))
+                if h is not None:
+                    sent = send_results_email(row["name"], row["company"], row["email"], r, i)
+                    if not sent:
+                        durable_limits.refund(h)         # nothing was delivered: do not burn the address's daily allowance
+            finally:
+                if not sent:
+                    # capped, failed, or interrupted: the claim goes back so a later save can still deliver the mail
+                    cur.execute("UPDATE calculator_leads SET email_sent = FALSE WHERE id = %s", (lead_id,))
+                    conn.commit()
 
         return {"status": "ok"}
 

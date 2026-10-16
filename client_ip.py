@@ -1,25 +1,40 @@
 """Real client IP behind Render's reverse proxy, for security-sensitive rate limiting only.
 
-Same semantics as the module of the same name in the engine repo (Oct 14 2026): last X-Forwarded-For entry, IPv6 reduced to its /64."""
+Public socket address first, last X-Forwarded-For hop as fallback; IPv6 reduced to its /64, IPv4-mapped IPv6 to IPv4."""
 from fastapi import Request
 
 
-def real_client_ip(request: Request) -> str:
-    """Never for anything IP-allowlist-like.
+def _parse(value):
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(value)
+    except (ValueError, TypeError):
+        return None
+    if a.version == 6 and a.ipv4_mapped is not None:
+        a = a.ipv4_mapped
+    return a
 
-    Render does not clear or reset a client-supplied X-Forwarded-For header —
-    it only appends the true connecting IP as the last entry (confirmed:
-    https://feedback.render.com/features/p/send-the-correct-xforwardedfor).
-    That means every entry except the last can be attacker-supplied, so only
-    the last entry is trustworthy. `request.client.host` alone would be
-    Render's own internal load balancer, not the caller, since Render proxies
-    over HTTP rather than passing the raw TCP connection through."""
+
+def real_client_ip(request: Request) -> str:
+    """The address of the visitor, for rate limiting only (never IP-allowlist-like).
+
+    Evidence (Render logs of this service, Oct 15 2026): uvicorn's `request.client.host` is already the visitor's true public IP and matches
+    Render's own clientIP request log field. So:
+      1. If client.host is a PUBLIC address (ipaddress `is_global`: not private, loopback, link-local, unspecified, CGNAT or documentation space),
+         use it and IGNORE X-Forwarded-For entirely: a forged header changes nothing.
+      2. Otherwise (host missing, not an IP such as the TestClient's 'testclient', or an internal address that means "a proxy in front of us"),
+         use the LAST X-Forwarded-For hop if it parses as an IP (Render appends the true peer last; every earlier entry is attacker-controlled).
+      3. Otherwise client.host, or 'unknown'."""
+    host = request.client.host if request.client else None
+    a = _parse(host)
+    if a is not None and a.is_global:
+        return str(a) if a.version == 4 else host
     xff = request.headers.get("x-forwarded-for")
     if xff:
         hops = [h.strip() for h in xff.split(",") if h.strip()]
-        if hops:
+        if hops and _parse(hops[-1]) is not None:
             return hops[-1]
-    return request.client.host if request.client else "unknown"
+    return host or "unknown"
 
 
 def ip_bucket(ip: str) -> str:

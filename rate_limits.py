@@ -1,8 +1,8 @@
 """In-memory abuse caps for the calculator endpoints (Oct 14 2026).
 
 Library: `limits` MovingWindowRateLimiter on MemoryStorage (exact, no burst-at-boundary). Properties the callers rely on:
-  * Per process, reset by a restart. The service runs ONE uvicorn process on Render, so the numbers below are the real numbers; with N workers they
-    would be N times looser (named in the change record).
+  * Per process, reset by a restart, and N workers would each count separately. That is acceptable ONLY for per-IP caps: an IP flood is bounded by
+    the IP, not by a victim. Everything that protects a victim mailbox or our sending domain is durable (durable_limits.py).
   * Memory: MemoryStorage trims a key's timestamps when its window has passed, but (limits 5.8.0, measured) it never removes the key itself, so a
     stream of distinct keys (one per address) would grow the dict without bound. sweep() below removes keys whose newest hit has expired, at most once
     every SWEEP_INTERVAL_S, so memory is bounded by the number of distinct keys seen inside the longest window (1 day), not by all keys ever seen.
@@ -23,17 +23,12 @@ logger = logging.getLogger("cdai.calculator_leads")
 _store = MemoryStorage()
 _limiter = MovingWindowRateLimiter(_store)
 
-# OTP request (mail from our domain to a caller-chosen address)
-SEND_CODE_PER_IP = parse("5/hour")
-SEND_CODE_PER_EMAIL = parse("3/hour")
-# OTP guess (6 digits, 10 minute life)
-VERIFY_PER_IP = parse("20 per 10 minutes")
-VERIFY_PER_EMAIL = parse("6 per 10 minutes")
+# Per-IP caps only. The per-mailbox, global and results-mail caps are durable and live in durable_limits.py.
+SEND_CODE_PER_IP = parse("5/hour")        # OTP request (mail from our domain to a caller-chosen address)
+VERIFY_PER_IP = parse("20 per 10 minutes")  # OTP guess (6 digits, 10 minute life)
 # funnel ping and live save
 VIEW_PER_IP = parse("60/minute")
 UPDATE_PER_IP = parse("120/minute")   # browser debounce is ~900 ms, about 66 a minute while typing
-# results email to the address stored on the lead
-RESULTS_EMAIL_PER_ADDRESS = parse("3/day")
 
 
 SWEEP_INTERVAL_S = 60

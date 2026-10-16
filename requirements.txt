@@ -1,6 +1,28 @@
-fastapi
-uvicorn
-psycopg2-binary
-resend
-python-dotenv
+# Pinned to the exact versions Render installed for the live service (build log Oct 8 2026 01:08 UTC, Python 3.14 cp314 wheels), plus
+# limits==5.8.0 and its dependencies at the versions the engine service already installs on Render's Python 3.14.3.
+# Direct dependencies are listed in requirements.in. tests/test_requirements_pinned.py fails on any line that is not name==version.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+charset_normalizer==3.5.2
+click==8.5.0
+deprecated==3.0.0
+fastapi==0.142.4
+h11==0.16.0
+idna==3.20
 limits==5.8.0
+opentelemetry-api==1.45.1
+packaging==26.3
+psycopg2-binary==2.9.13
+pydantic-core==2.46.5
+pydantic==2.13.5
+python-dotenv==1.2.4
+requests==2.34.2
+resend==2.49.1
+starlette==1.7.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.8.0
+uvicorn==0.54.0
+wrapt==2.5.0

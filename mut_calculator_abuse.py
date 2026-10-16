@@ -3,8 +3,9 @@ Run: python mut_calculator_abuse.py        Each row: (name, file, [(old, new), .
 import os, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CL, RL, CIP = "calculator_leads.py", "rate_limits.py", "client_ip.py"
+CL, RL, CIP, DL, MAIN, REQ, PYV = "calculator_leads.py", "rate_limits.py", "client_ip.py", "durable_limits.py", "main.py", "requirements.txt", ".python-version"
 TEST = os.path.join("tests", "test_calculator_abuse_caps.py")
+PINT = os.path.join("tests", "test_requirements_pinned.py")
 IPD = 'if not rate_limits.allow(limit, ip_bucket(real_client_ip(request)), namespace):'
 M = [
  # --- caps removed
@@ -12,38 +13,22 @@ M = [
  ("verify IP cap removed", CL, [('_gate: None = Depends(_ip_gate(rate_limits.VERIFY_PER_IP, "calc_verify_ip"))', '_gate: None = None')]),
  ("PATCH IP cap removed", CL, [('_gate: None = Depends(_ip_gate(rate_limits.UPDATE_PER_IP, "calc_update_ip"))', '_gate: None = None')]),
  ("view IP cap removed", CL, [('if not rate_limits.allow(rate_limits.VIEW_PER_IP, ip_bucket(real_client_ip(request)), "calc_view_ip"):', 'if False:')]),
- ("send-code per-address cap removed", CL, [('if not rate_limits.allow(rate_limits.SEND_CODE_PER_EMAIL, _cap_key(email), "calc_code_email"):', 'if False:')]),
- ("verify per-address cap removed", CL, [('if not rate_limits.allow(rate_limits.VERIFY_PER_EMAIL, _cap_key(email), "calc_verify_email"):', 'if False:')]),
- ("results-email per-address cap removed", CL, [('if should_email and rate_limits.allow(\n                rate_limits.RESULTS_EMAIL_PER_ADDRESS,\n                _cap_key(str(row["email"]).strip().lower()), "calc_results_email"):', 'if should_email:')]),
- ("results-email cap keyed case-sensitively", CL, [('_cap_key(str(row["email"]).strip().lower()), "calc_results_email"', '_cap_key(str(row["email"])), "calc_results_email"')]),
  ("address not lower-cased before keying", CL, [('v = (raw or "").strip().lower()', 'v = (raw or "").strip()')]),
  ("view over cap still inserts", CL, [('"calc_view_ip"):\n        return {"status": "ok"}', '"calc_view_ip"):\n        pass')]),
- ("over-cap send-code still stores OTP and mails", CL, [('    if not rate_limits.allow(rate_limits.SEND_CODE_PER_EMAIL, _cap_key(email), "calc_code_email"):\n        raise _too_many()\n', '    _over = not rate_limits.allow(rate_limits.SEND_CODE_PER_EMAIL, _cap_key(email), "calc_code_email")\n'),
-                                                         ('    sent = send_otp_email(name, email, code)\n    if not sent:', '    sent = send_otp_email(name, email, code)\n    if _over:\n        raise _too_many()\n    if not sent:')]),
- ("verify cap checked after the code lookup", CL, [('    if not rate_limits.allow(rate_limits.VERIFY_PER_EMAIL, _cap_key(email), "calc_verify_email"):\n        raise _too_many()\n', '    _over = not rate_limits.allow(rate_limits.VERIFY_PER_EMAIL, _cap_key(email), "calc_verify_email")\n'),
-                                                   ('        otp = cur.fetchone()\n', '        otp = cur.fetchone()\n        if _over and not otp:\n            raise _too_many()\n')]),
  # --- review round 1 fixes
  ("IPv4-mapped IPv6 collapses into ::/64", CIP, [('        if a.ipv4_mapped is not None:', '        if False:')]),
  ("apostrophe addresses refused again", CL, [('[^@\\s<>\\",;()', '[^@\\s<>\\\'",;()')]),
  ("new-style TLD refused (letters only)", CL, [('\\.[A-Za-z][A-Za-z0-9-]{1,}")', '\\.[A-Za-z]{2,}")')]),
- ("send-code cap keyed on the exact address", CL, [('rate_limits.SEND_CODE_PER_EMAIL, _cap_key(email), "calc_code_email"', 'rate_limits.SEND_CODE_PER_EMAIL, email, "calc_code_email"')]),
- ("verify cap keyed on the exact address", CL, [('rate_limits.VERIFY_PER_EMAIL, _cap_key(email), "calc_verify_email"', 'rate_limits.VERIFY_PER_EMAIL, email, "calc_verify_email"')]),
- ("results cap keyed on the exact address", CL, [('_cap_key(str(row["email"]).strip().lower()), "calc_results_email"', 'str(row["email"]).strip().lower(), "calc_results_email"')]),
  ("+tag not dropped from the cap key", CL, [('    local = local.split("+", 1)[0]\n', '')]),
  ("Google dots not dropped from the cap key", CL, [('local, domain = local.replace(".", ""), "gmail.com"', 'local, domain = local, "gmail.com"')]),
  ("googlemail not read as gmail", CL, [('local, domain = local.replace(".", ""), "gmail.com"', 'local, domain = local.replace(".", ""), domain')]),
  ("dots dropped for every provider", CL, [('    if domain in _GOOGLE_DOMAINS:\n        local, domain = local.replace(".", ""), "gmail.com"', '    if True:\n        local, domain = local.replace(".", ""), ("gmail.com" if domain in _GOOGLE_DOMAINS else domain)')]),
  # --- limit values
  ("send-code IP limit loosened", RL, [('parse("5/hour")', 'parse("6/hour")')]),
- ("send-code address limit loosened", RL, [('parse("3/hour")', 'parse("4/hour")')]),
  ("send-code IP window widened", RL, [('parse("5/hour")', 'parse("5/day")')]),
  ("verify IP limit loosened", RL, [('parse("20 per 10 minutes")', 'parse("21 per 10 minutes")')]),
- ("verify address limit loosened", RL, [('parse("6 per 10 minutes")', 'parse("7 per 10 minutes")')]),
- ("verify address window shortened", RL, [('parse("6 per 10 minutes")', 'parse("6 per 1 minute")')]),
  ("view limit loosened", RL, [('parse("60/minute")', 'parse("61/minute")')]),
  ("PATCH limit loosened", RL, [('parse("120/minute")', 'parse("121/minute")')]),
- ("results-email limit loosened", RL, [('parse("3/day")', 'parse("4/day")')]),
- ("results-email window shortened", RL, [('parse("3/day")', 'parse("3/hour")')]),
  ("limiter fails open", RL, [('logger.error("[CALC] rate limiter error: %s", type(e).__name__)\n        return False', 'logger.error("[CALC] rate limiter error: %s", type(e).__name__)\n        return True')]),
  ("sweep never runs", RL, [('    _maybe_sweep()\n    try:', '    try:')]),
  ("sweep drops live keys", RL, [('continue                       # newest hit still inside its window: live', 'pass'), ('continue                   # a hit landed while we waited for the lock', 'pass')]),
@@ -58,7 +43,6 @@ M = [
  ("IP key ignores the bucket", CL, [(IPD, 'if not rate_limits.allow(limit, real_client_ip(request), namespace):')]),
  # --- validation
  ("e-mail not validated", CL, [('if len(v) > EMAIL_MAX or not _EMAIL_RE.fullmatch(v):', 'if False:')]),
- ("e-mail length uncapped", CL, [('if len(v) > EMAIL_MAX or not _EMAIL_RE.fullmatch(v):', 'if not _EMAIL_RE.fullmatch(v):')]),
  ("e-mail allows whitespace", CL, [('[^@\\s<>\\",;()', '[^@<>\\",;()')]),
  ("e-mail allows control characters", CL, [('\\\\\\x00-\\x1f\\x7f]+@', '\\\\]+@')]),
  ("e-mail allows angle brackets", CL, [('[^@\\s<>\\",;()', '[^@\\s\\",;()')]),
@@ -67,12 +51,10 @@ M = [
  ("company cap loosened", CL, [('NAME_MAX, COMPANY_MAX, EMAIL_MAX, SESSION_ID_MAX, JSON_MAX_CHARS = 100, 200,', 'NAME_MAX, COMPANY_MAX, EMAIL_MAX, SESSION_ID_MAX, JSON_MAX_CHARS = 100, 2000,')]),
  ("control characters accepted in name/company", CL, [('    if _CONTROL_RE.search(v):', '    if False:')]),
  ("C1 controls not in the control class", CL, [('_CONTROL_RE = re.compile(r"[\\x00-\\x1f\\x7f-\\x9f]")', '_CONTROL_RE = re.compile(r"[\\x00-\\x1f\\x7f]")')]),
- ("JSON size uncapped", CL, [('    if size > JSON_MAX_CHARS:', '    if False:')]),
  ("JSON size cap loosened", CL, [('JSON_MAX_CHARS = 100, 200, 254, 100, 20000', 'JSON_MAX_CHARS = 100, 200, 254, 100, 2000000')] if False else [('SESSION_ID_MAX, JSON_MAX_CHARS = 100, 200, 254, 100, 20000', 'SESSION_ID_MAX, JSON_MAX_CHARS = 100, 200, 254, 100, 2000000')]),
  ("session_id length uncapped", CL, [('if payload.session_id is not None and len(payload.session_id) > SESSION_ID_MAX:', 'if False:')]),
  ("lead id not validated as UUID", CL, [('    try:\n        uuid.UUID(lead_id)\n    except ValueError:\n        raise HTTPException(status_code=404, detail="Lead not found")\n', '')]),
  ("code shape not checked before the database", CL, [('    if not _CODE_RE.fullmatch(code):', '    if False:')]),
- ("PATCH JSON size not checked", CL, [('    _check_json_size(payload.inputs, "inputs")\n    _check_json_size(payload.results, "results")\n\n    conn = get_conn()\n    cur  = conn.cursor()\n    try:\n        cur.execute("""\n            UPDATE', '    conn = get_conn()\n    cur  = conn.cursor()\n    try:\n        cur.execute("""\n            UPDATE')]),
  ("generic refusal text reveals the limit", CL, [('TOO_MANY_DETAIL = "Too many requests. Please try again later."', 'TOO_MANY_DETAIL = "Too many requests (address limit). Please try again later."')]),
  # --- OTP
  ("OTP back to random.randint", CL, [('code = f"{secrets.randbelow(10**6):06d}"', 'code = f"{__import__(\'random\').randint(0, 999999):06d}"')]),
@@ -96,12 +78,92 @@ M = [
  ("address logged on Beehiiv success", CL, [('logger.info("[CALC] Beehiiv subscribe requested")', 'logger.info("[CALC] Beehiiv subscribe requested %s", email)')]),
  # --- behaviour that must not change
  ("Beehiiv no longer called", CL, [('        _subscribe_beehiiv(email)\n', '')]),
- ("results mail sent without setting email_sent", CL, [('"UPDATE calculator_leads SET email_sent = TRUE WHERE id = %s"', '"SELECT %s"')]),
+ # --- round 2: durable per-mailbox / global / results caps
+ ("send-code per-mailbox cap not enforced", CL, [('    if h_mailbox is None:', '    if False:')]),
+ ("send-code global ceiling not enforced", CL, [('    if h_global is None:', '    if False:')]),
+ ("global refusal keeps the visitor's mailbox hit", CL, [('        durable_limits.refund(h_mailbox)         # the visitor did nothing wrong: the service ceiling is what refused\n', '')]),
+ ("failed send keeps both allowances", CL, [('        durable_limits.refund(h_mailbox)\n        durable_limits.refund(h_global)\n', '        pass\n')]),
+ ("failed send keeps the OTP row", CL, [('        if otp_id is not None:', '        if False:')]),
+ ("send-code per-mailbox key is the exact address", CL, [('durable_limits.SEND_CODE_PER_MAILBOX, _cap_key(email))', 'durable_limits.SEND_CODE_PER_MAILBOX, email)')]),
+ ("send-code global key varies per caller", CL, [('durable_limits.hit(durable_limits.SEND_CODE_GLOBAL, durable_limits.GLOBAL_KEY)', 'durable_limits.hit(durable_limits.SEND_CODE_GLOBAL, email)')]),
+ ("verify per-mailbox cap not enforced", CL, [('    if durable_limits.hit(durable_limits.VERIFY_PER_MAILBOX, _cap_key(email)) is None:', '    if False:')]),
+ ("verify per-mailbox key is the exact address", CL, [('durable_limits.VERIFY_PER_MAILBOX, _cap_key(email))', 'durable_limits.VERIFY_PER_MAILBOX, email)')]),
+ ("results per-mailbox cap not enforced", CL, [('                if h is not None:\n                    sent = send_results_email', '                if True:\n                    sent = send_results_email')]),
+ ("results per-mailbox key is the exact address", CL, [('durable_limits.RESULTS_PER_MAILBOX, _cap_key(str(row["email"]).strip().lower()))', 'durable_limits.RESULTS_PER_MAILBOX, str(row["email"]).strip().lower())')]),
+ ("failed results mail keeps the daily hit", CL, [('                        durable_limits.refund(h)         # nothing was delivered: do not burn the address\'s daily allowance\n', '')]),
+ ("capped or failed results claim is never released", CL, [('cur.execute("UPDATE calculator_leads SET email_sent = FALSE WHERE id = %s", (lead_id,))', 'cur.execute("SELECT 1")')]),
+ ("results claim is not atomic", CL, [('WHERE id = %s AND email_sent = FALSE RETURNING id', 'WHERE id = %s RETURNING id')]),
+ ("results mail sent without a claim", CL, [('        if claimed:\n            sent = False', '        if meaningful:\n            sent = False')]),
+ ("JSON size uncapped", CL, [('    if len(text) > JSON_MAX_CHARS:', '    if False:')]),
+ ("PATCH results JSON not size-checked", CL, [('    results_json = _json_text(payload.results, "results")\n\n    conn = get_conn()', '    results_json = json.dumps(payload.results or {})\n\n    conn = get_conn()')]),
+ ("NaN/Infinity not mapped to null", CL, [('json.loads(json.dumps(v), parse_constant=lambda _c: None)', 'json.loads(json.dumps(v))')]),
+ ("_num lets booleans through", CL, [('    if isinstance(v, bool) or not isinstance(v, (int, float)):', '    if not isinstance(v, (int, float)):')]),
+ ("_num lets strings through", CL, [('    if isinstance(v, bool) or not isinstance(v, (int, float)):', '    if isinstance(v, bool):')]),
+ ("_num lets non-finite numbers through", CL, [('        return v if math.isfinite(v) else 0', '        return v')]),
+ ("_num does not catch huge ints", CL, [('    except OverflowError:\n        return 0', '    except ZeroDivisionError:\n        return 0')]),
+ ("results mail does not coerce reportedCpl", CL, [('reported_cpl = _num(results.get("reportedCpl", 0))', 'reported_cpl = results.get("reportedCpl", 0)')]),
+ ("results mail does not coerce cmPct", CL, [('cm_pct       = _num(results.get("cmPct", 0))', 'cm_pct       = results.get("cmPct", 0)')]),
+ ("results mail does not coerce hiddenCosts", CL, [('hidden_costs = _num(results.get("hiddenCosts", 0))', 'hidden_costs = results.get("hiddenCosts", 0)')]),
+ ("results mail does not coerce cplGapPct", CL, [('cpl_gap_pct  = _num(results.get("cplGapPct", 0))', 'cpl_gap_pct  = results.get("cplGapPct", 0)')]),
+ ("PATCH compares raw adSpend", CL, [('_num(i.get("adSpend", 0)) > 0', 'i.get("adSpend", 0) > 0')]),
+ ("PATCH compares raw leads", CL, [('and _num(i.get("leads", 0)) > 0', 'and i.get("leads", 0) > 0')]),
+ ("PATCH compares raw trueCpl", CL, [('and _num(r.get("trueCpl", 0)) > 0', 'and r.get("trueCpl", 0) > 0')]),
+ # durable_limits.py itself
+ ("durable: no per-key lock", DL, [('cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (bucket + ":" + k,))', 'cur.execute("SELECT 1")')]),
+ ("durable: off by one at the limit", DL, [('if cur.fetchone()[0] >= limit:', 'if cur.fetchone()[0] > limit:')]),
+ ("durable: window ignored", DL, [('clock_timestamp() - make_interval(secs => %s)",\n                (bucket, key, window_seconds))', 'clock_timestamp() - make_interval(secs => 0 * %s)",\n                (bucket, key, window_seconds))')] if False else [('at > clock_timestamp() - make_interval(secs => %s)', 'at > clock_timestamp() - make_interval(secs => 0 * %s)')]),
+ ("durable: window doubled", DL, [('at > clock_timestamp() - make_interval(secs => %s)', 'at > clock_timestamp() - make_interval(secs => 2 * %s)')]),
+ ("durable: keys share one counter per bucket", DL, [('WHERE bucket = %s AND key = %s AND at', 'WHERE bucket = %s AND %s IS NOT NULL AND at')]),
+ ("durable: buckets share counters", DL, [('WHERE bucket = %s AND key = %s AND at', 'WHERE %s IS NOT NULL AND key = %s AND at')]),
+ ("durable: fails open", DL, [('        logger.error("[CALC] durable limiter error: %s", type(e).__name__)\n        return None', '        logger.error("[CALC] durable limiter error: %s", type(e).__name__)\n        return 1')]),
+ ("durable: refund does nothing", DL, [('cur.execute("DELETE FROM calculator_rate_events WHERE id = %s", (handle,))', 'cur.execute("SELECT %s", (handle,))')]),
+ ("durable: purge window wrong", DL, [('PURGE_AFTER = "2 days"', 'PURGE_AFTER = "1 day"')]),
+ ("durable: purge never runs", DL, [('due = _calls % PURGE_EVERY_CALLS == 0', 'due = False')]),
+ ("durable: purge on every call", DL, [('due = _calls % PURGE_EVERY_CALLS == 0', 'due = True')]),
+ ("durable: purge deletes everything", DL, [("WHERE at < NOW() - INTERVAL '{PURGE_AFTER}'\"", "WHERE at < NOW() + INTERVAL '{PURGE_AFTER}'\"")]),
+ ("durable: address stored in the clear", DL, [('        k = _hash(key)', '        k = key')]),
+ ("durable: table never created", DL, [('        ensure_table()\n', '')]),
+ ("durable: table creation not idempotent", DL, [('CREATE TABLE IF NOT EXISTS calculator_rate_events', 'CREATE TABLE calculator_rate_events')]),
+ ("durable: purge index missing", DL, [('    "CREATE INDEX IF NOT EXISTS calculator_rate_events_at ON calculator_rate_events (at)",     # serves the purge\n', '')]),
+ ("durable: lookup index missing", DL, [('    "CREATE INDEX IF NOT EXISTS calculator_rate_events_bucket_key_at ON calculator_rate_events (bucket, key, at)",\n', '')]),
+ ("durable: global limit loosened", DL, [('Cap("global_code", 100, 3600)', 'Cap("global_code", 101, 3600)')]),
+ ("durable: mailbox send limit loosened", DL, [('Cap("code_mailbox", 3, 3600)', 'Cap("code_mailbox", 4, 3600)')]),
+ ("durable: mailbox send window shortened", DL, [('Cap("code_mailbox", 3, 3600)', 'Cap("code_mailbox", 3, 60)')]),
+ ("durable: verify limit loosened", DL, [('Cap("verify_mailbox", 6, 600)', 'Cap("verify_mailbox", 7, 600)')]),
+ ("durable: verify window shortened", DL, [('Cap("verify_mailbox", 6, 600)', 'Cap("verify_mailbox", 6, 60)')]),
+ ("durable: results limit loosened", DL, [('Cap("results_mailbox", 3, 86400)', 'Cap("results_mailbox", 4, 86400)')]),
+ ("durable: results window shortened", DL, [('Cap("results_mailbox", 3, 86400)', 'Cap("results_mailbox", 3, 3600)')]),
+ # client address
+ ("client address: forged header beats a public socket address", CIP, [('    if a is not None and a.is_global:\n        return str(a) if a.version == 4 else host', '    if False:\n        return host')]),
+ ("client address: private socket address trusted", CIP, [('    if a is not None and a.is_global:', '    if a is not None:')]),
+ ("client address: non-IP last hop accepted", CIP, [('        if hops and _parse(hops[-1]) is not None:', '        if hops:')]),
+ ("client address: IPv4-mapped host not unwrapped", CIP, [('    if a.version == 6 and a.ipv4_mapped is not None:\n        a = a.ipv4_mapped', '    if False:\n        a = a.ipv4_mapped')]),
+ ("client address: forwarded header used first", CIP, [('    host = request.client.host if request.client else None\n    a = _parse(host)\n    if a is not None and a.is_global:', '    host = request.client.host if request.client else None\n    a = _parse(host)\n    if False:')]),
+ # request body cap
+ ("body cap middleware not installed", MAIN, [('app.add_middleware(BodyLimitMiddleware)\n\napp.add_middleware(', 'app.add_middleware(')]),
+ ("body cap outside CORS (413 loses CORS headers)", MAIN, [('app.add_middleware(BodyLimitMiddleware)\n\napp.add_middleware(', 'app.add_middleware('), ('app.include_router(calculator_router)', 'app.add_middleware(BodyLimitMiddleware)\napp.include_router(calculator_router)')]),
+ ("declared length not checked", MAIN, [('                if declared > self.max_bytes:\n                    return await self._reject(send)', '                if False:\n                    return await self._reject(send)')]),
+ ("declared length off by one", MAIN, [('                if declared > self.max_bytes:', '                if declared >= self.max_bytes:')]),
+ ("unparseable length accepted", MAIN, [('declared = self.max_bytes + 1       # unparseable length: refuse', 'declared = 0')]),
+ ("streamed bytes not counted", MAIN, [('                if received > self.max_bytes:\n                    too_large = True', '                if False:\n                    too_large = True')]),
+ ("streamed limit off by one", MAIN, [('                if received > self.max_bytes:\n                    too_large = True', '                if received >= self.max_bytes:\n                    too_large = True')]),
+ ("limit loosened", MAIN, [('MAX_BODY_BYTES = 65536', 'MAX_BODY_BYTES = 655360')]),
+ ("app's own answer leaks after an overflow", MAIN, [('            if too_large and not rejected:\n                if not started:', '            if False:\n                if not started:')]),
+ ("silent app after overflow gets no 413", MAIN, [('        if too_large and not started:\n            await self._reject(send)\n\n', '        pass\n\n')]),
+ ("crashing app after overflow is re-raised", MAIN, [('            if too_large and not started:\n                started = rejected = True\n                await self._reject(send)\n                return\n            if too_large:\n                return\n            raise', '            raise')]),
+ ("body cap applied to non-HTTP scopes", MAIN, [('        if scope["type"] != "http":\n            return await self.app(scope, receive, send)\n', '')]),
+ # pinned dependencies
+ ("requirements: a range instead of a pin", REQ, [('\nlimits==5.8.0\n', '\nlimits>=5.8.0\n')], PINT),
+ ("requirements: a dependency unpinned", REQ, [('fastapi==0.142.4', 'fastapi')], PINT),
+ ("requirements: limits pin changed", REQ, [('\nlimits==5.8.0\n', '\nlimits==5.9.0\n')], PINT),
+ ("requirements: limits dependency dropped", REQ, [('wrapt==2.5.0\n', '')], PINT),
+ ("requirements: Python version unpinned", PYV, [('3.14.3', '3.14')], PINT),
 ]
 SRC = {f: open(os.path.join(ROOT, f), encoding="utf8").read() for f in {m[1] for m in M}}
 
 def run(m):
-    name, f, edits = m
+    name, f, edits = m[:3]
+    test = m[3] if len(m) > 3 else TEST
     s = SRC[f]
     for old, new in edits:
         if s.count(old) != 1:
@@ -110,10 +172,10 @@ def run(m):
     d = tempfile.mkdtemp()
     try:
         for x in os.listdir(ROOT):
-            if x.endswith(".py"): shutil.copy(os.path.join(ROOT, x), d)
+            if x.endswith((".py", ".txt", ".in")) or x == ".python-version": shutil.copy(os.path.join(ROOT, x), d)
         shutil.copytree(os.path.join(ROOT, "tests"), os.path.join(d, "tests"), ignore=shutil.ignore_patterns("__pycache__"))
         open(os.path.join(d, f), "w", encoding="utf8").write(s)
-        r = subprocess.run([sys.executable, TEST], cwd=d, capture_output=True, text=True, timeout=600)
+        r = subprocess.run([sys.executable, test], cwd=d, capture_output=True, text=True, timeout=600)
         out = r.stdout + r.stderr
         failing = [l.strip()[6:] for l in out.splitlines() if l.strip().startswith("FAIL")]
         if r.returncode == 0:
@@ -122,6 +184,8 @@ def run(m):
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+ONLY = [x for x in os.environ.get("MUT_ONLY", "").split("|") if x]      # optional: re-run only mutants whose name contains one of these
+if ONLY: M = [m for m in M if any(o in m[0] for o in ONLY)]
 with ThreadPoolExecutor(max_workers=4) as ex:
     results = list(ex.map(run, M))
 bad = sum(b for _, b in results)
