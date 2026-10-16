@@ -55,6 +55,13 @@ def db(sql, args=()):
     out = cur.fetchall() if cur.description else None
     c.commit(); c.close(); return out
 def n(table): return db(f"SELECT count(*) FROM {table}")[0][0]
+def fill(cap, count, key=None):
+    """Put `count` hits in the window in ONE statement. A hit-per-call loop of 300 takes seconds on a loaded machine, and the oldest hits then age out
+    of a window that a 'N seconds before expiry' check expects them to still be in (found as a flaky failure in a repeat run)."""
+    key = dl.GLOBAL_KEY if key is None else key
+    dl.hit(cap, key)
+    db("INSERT INTO calculator_rate_events (bucket, key) SELECT bucket, key FROM calculator_rate_events, generate_series(1, %s) WHERE bucket = %s",
+       (count - 1, cap.bucket))
 def reset():
     rl.reset(); SENT.clear(); dl._fail_until = 0.0
     db("DO $$ BEGIN IF to_regclass('calculator_rate_events') IS NOT NULL THEN DELETE FROM calculator_rate_events; END IF; END $$")
@@ -525,7 +532,7 @@ real_key = os.environ.pop("RESEND_API_KEY"); patch(lead, addr=ip()); os.environ[
 check(not SENT and events("results_mailbox") == 0 and events("results_claim") == 0 and email_sent_flag(lead) is False, "no API key configured is a DEFINITE pre-send failure: both hits refunded")
 patch(lead, addr=ip()); check(len(SENT) == 1 and email_sent_flag(lead) is True, "and the next save delivers it")
 reset()
-for _ in range(100): dl.hit(dl.SEND_CODE_GLOBAL, dl.GLOBAL_KEY)
+fill(dl.SEND_CODE_GLOBAL, 100)
 o0 = n("calculator_otps"); SENT.clear()
 r = send_code("pausechk@example.com", addr=ip())
 check(r.status_code == 429 and r.json() == {"detail": GENERIC} and n("calculator_otps") == o0 and not SENT, "global ceiling reached: 429, generic text, no OTP row, no mail")
@@ -536,12 +543,12 @@ print("-- 22. time travel: N allowed, N+1 refused, allowed again after the windo
 def sc(i, addr): return send_code(f"tt{i}@example.com", addr=addr).status_code
 reset(); A = "21.0.0.1"
 check([sc(i, A) for i in range(6)] == [200] * 5 + [429], "send-code per IP: 5 allowed, 6th refused")
-clock.off += 3599; check(sc(7, A) == 429, "send-code per IP: still refused 1 s before the hour is up")
-clock.off += 2; check(sc(8, A) == 200, "send-code per IP: allowed again after the hour")
+clock.off += 3570; check(sc(7, A) == 429, "send-code per IP: still refused 30 s before the hour is up")   # 30 s margin: the six requests above can take seconds on a loaded machine (flaky at 1 s)
+clock.off += 40; check(sc(8, A) == 200, "send-code per IP: allowed again after the hour")
 reset(); A = "21.0.0.2"
 check([verify(f"vt{i}@example.com", addr=A).status_code for i in range(21)] == [400] * 20 + [429], "verify per IP: 20 allowed, 21st refused")
-clock.off += 599; check(verify("vt99@example.com", addr=A).status_code == 429, "verify per IP: refused just inside 10 minutes")
-clock.off += 2; check(verify("vt99@example.com", addr=A).status_code == 400, "verify per IP: allowed again after 10 minutes")
+clock.off += 570; check(verify("vt99@example.com", addr=A).status_code == 429, "verify per IP: refused 30 s inside 10 minutes")   # 30 s margin, see above
+clock.off += 40; check(verify("vt99@example.com", addr=A).status_code == 400, "verify per IP: allowed again after 10 minutes")
 reset(); A = "21.0.0.3"; v0 = n("calculator_views")
 for i in range(61): http.post("/calculator-view", json={"session_id": "t"}, headers=H(A))
 check(n("calculator_views") - v0 == 60, "view per IP: 60 stored, 61st not")
@@ -558,11 +565,11 @@ check([send_code(mb, addr=ip()).status_code for _ in range(4)] == [200, 200, 200
 backdate("code_mailbox", 3595); check(send_code(mb, addr=ip()).status_code == 429, "send-code per mailbox: still refused inside the hour")
 backdate("code_mailbox", 10); check(send_code(mb, addr=ip()).status_code == 200, "send-code per mailbox: allowed again after the hour")
 reset()
-for _ in range(100): dl.hit(dl.SEND_CODE_GLOBAL, dl.GLOBAL_KEY)
+fill(dl.SEND_CODE_GLOBAL, 100)
 backdate("global_code", 3595); check(send_code("g1@example.com", addr=ip()).status_code == 429, "global: still refused inside the hour")
 backdate("global_code", 10); check(send_code("g1@example.com", addr=ip()).status_code == 200, "global: allowed again after the hour")
 reset()
-for _ in range(99): dl.hit(dl.SEND_CODE_GLOBAL, dl.GLOBAL_KEY)
+fill(dl.SEND_CODE_GLOBAL, 99)
 check(send_code("g2@example.com", addr=ip()).status_code == 200 and send_code("g3@example.com", addr=ip()).status_code == 429, "global: the 100th request is allowed, the 101st refused")
 reset(); send_code("vm@example.com", addr=ip())
 check([verify("vm@example.com", "000000", addr=ip()).status_code for _ in range(7)][-2:] == [400, 429], "verify per mailbox: 6th reaches the lookup, 7th refused")
@@ -883,7 +890,7 @@ reset()
 
 print("-- 32. service-wide verify ceiling (300 per hour)")
 reset()
-for _ in range(300): dl.hit(dl.VERIFY_GLOBAL, dl.GLOBAL_KEY)
+fill(dl.VERIFY_GLOBAL, 300)
 send_code("vg@example.com", addr=ip())
 r = verify("vg@example.com", "000000", addr=ip())
 check(r.status_code == 429 and r.json() == {"detail": GENERIC}, "ceiling reached: 429 with the generic text")
@@ -891,7 +898,7 @@ check(events("verify_mailbox") == 0, "the visitor's own mailbox hit was refunded
 backdate("global_verify", 3595); check(verify("vg@example.com", "000000", addr=ip()).status_code == 429, "still refused 5 s before the hour is up")
 backdate("global_verify", 10); check(verify("vg@example.com", "000000", addr=ip()).status_code == 400, "allowed again after the hour")
 reset()
-for _ in range(299): dl.hit(dl.VERIFY_GLOBAL, dl.GLOBAL_KEY)
+fill(dl.VERIFY_GLOBAL, 299)
 seed_otp("vg1@example.com"); seed_otp("vg2@example.com")
 check(verify("vg1@example.com", "000000", addr=ip()).status_code == 400 and verify("vg2@example.com", "000000", addr=ip()).status_code == 429, "the 300th verify is allowed, the 301st refused")
 reset()
