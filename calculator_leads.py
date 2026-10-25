@@ -393,9 +393,9 @@ def send_results_email(name: str, company: str, email: str,
   </div>
   <div class="option">
     <span class="opt-lbl">Option 02 — Full Access</span>
-    <span class="opt-title">CDAI Retainer</span>
-    <p class="opt-desc">CDAI connects to your ad accounts, CRM, and lead distribution stack. One directive per campaign, every morning — Scale, Hold, Cut, Pause, Quarantine, Renegotiate, Investigate, or Flag — based on your true margin after every cost layer. Automated, continuous, no spreadsheets.</p>
-    <a class="btn-gold" href="https://alloceraintelligence.com/#intake">Learn More &rarr;</a>
+    <span class="opt-title">CDAI Retainer — from $497/month</span>
+    <p class="opt-desc">CDAI connects to your ad accounts, CRM, and lead distribution stack. One directive per campaign, every morning — Scale, Hold, Cut, Pause, Quarantine, Renegotiate, Investigate, or Flag — based on your true margin after every cost layer. Automated, continuous, no spreadsheets. Plans start at $497/month for up to $10K/month in ad spend. Sign up and pay online.</p>
+    <a class="btn-gold" href="https://cdai-portal.vercel.app/signup/">Get Started &rarr;</a>
   </div>
   <div class="newsletter">
     <p class="nl-title">The Margin Gap — Free Newsletter</p>

@@ -62,6 +62,8 @@ M = [
  ("subject length uncapped", CL, [(')[:SUBJECT_MAX]\n        company_html', ')\n        company_html')]),
  ("subject cap off by one", CL, [(')[:SUBJECT_MAX]\n        company_html', ')[:SUBJECT_MAX + 1]\n        company_html')]),
  ("newsletter cadence phrase restored", CL, [('The cost layers your dashboard never shows. Free.', 'The cost layers your dashboard never shows. Every two weeks, free.')]),
+ ("retainer button back to the intake form", CL, [('<a class="btn-gold" href="https://cdai-portal.vercel.app/signup/">Get Started &rarr;</a>', '<a class="btn-gold" href="https://alloceraintelligence.com/#intake">Get Started &rarr;</a>')]),
+ ("Entry price dropped from the retainer title", CL, [('CDAI Retainer — from $497/month', 'CDAI Retainer')]),
  ("escaping changes ordinary text", CL, [('company_html = _escape(company)', 'company_html = _escape(company).replace(" ", "&nbsp;")')]),
  # --- logs
  ("address logged on lead creation", CL, [('logger.info("[CALC] Verified + lead created: %s", lead_id)', 'logger.info("[CALC] Verified + lead created: %s", email)')]),
