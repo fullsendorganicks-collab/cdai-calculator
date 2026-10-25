@@ -285,7 +285,7 @@ SENT.clear(); full_flow("api-esc@example.com", company="Tom & Jerry <b>x</b>")
 patch(db("SELECT id FROM calculator_leads WHERE email='api-esc@example.com'")[0][0], addr=ip())
 check(len(SENT) == 2 and "Tom &amp; Jerry &lt;b&gt;x&lt;/b&gt;" in SENT[1]["html"] and "Tom & Jerry <b>x</b>" in SENT[1]["subject"], "end to end: body escaped, plain-text subject not HTML-escaped")
 
-print("-- 11. emails byte-identical to origin/main except the one removed phrase")
+print("-- 11. emails byte-identical to the original except the listed edits (the removed phrase; Oct 25 2026: Option 02 links to signup with the Entry price)")
 spec = importlib.util.spec_from_file_location("orig_main", os.path.join(HERE, "fixtures", "calculator_leads_original_main.py"))
 orig = importlib.util.module_from_spec(spec); spec.loader.exec_module(orig)
 check("random.randint" in open(os.path.join(HERE, "fixtures", "calculator_leads_original_main.py")).read(), "fixture is the original (random-based) file")
@@ -294,7 +294,21 @@ if gitcopy.returncode == 0:
     check(gitcopy.stdout == open(os.path.join(HERE, "fixtures", "calculator_leads_original_main.py")).read(), "fixture equals `git show 2f57426:calculator_leads.py`")
 else:
     print("  (git history for the base commit not available here; fixture used as is)")
-PHRASE = "Every two weeks, free."   # the only edit: becomes "Free."
+PHRASE = "Every two weeks, free."   # edit 1 (Oct 14): becomes "Free."
+# Edit 2 (Oct 25 2026, test_results_email_cta.py): the retainer option names the $497/month Entry plan and its button goes to signup instead of #intake.
+OPT2 = [('<span class="opt-title">CDAI Retainer</span>', '<span class="opt-title">CDAI Retainer — from $497/month</span>'),
+        ('Automated, continuous, no spreadsheets.</p>', 'Automated, continuous, no spreadsheets. Plans start at $497/month for up to $10K/month in ad spend. Sign up and pay online.</p>'),
+        ('<a class="btn-gold" href="https://alloceraintelligence.com/#intake">Learn More &rarr;</a>', '<a class="btn-gold" href="https://cdai-portal.vercel.app/signup/">Get Started &rarr;</a>'),
+        # Edit 3 (Oct 25 2026, independent review): the engine runs nightly, and who qualifies is HubSpot or Salesforce plus ads.
+        ('every campaign, every morning', 'every campaign, every night'),
+        ('CDAI connects to your ad accounts, CRM, and lead distribution stack. One directive per campaign, every morning', 'CDAI connects your HubSpot or Salesforce to your ad accounts and gives one call per campaign, every night'),
+        ('based on your true margin after every cost layer.', 'based on its true profit after every recorded cost.')]
+def expected_results_html(h):
+    h = h.replace(PHRASE, "Free.")
+    for a, b in OPT2:
+        assert h.count(a) == 1, a
+        h = h.replace(a, b)
+    return h
 samples = [("Jane Smith", "Acme Roofing", "jane@example.com", GOOD_R, GOOD_I),
            ("Bob", "Delta Solar LLC", "bob@example.org", {"reportedCpl": 42.5, "trueCpl": 31.1, "hiddenCosts": 12345.6, "cmPct": -7.25, "cplGapPct": -26.8}, {"adSpend": 5000, "leads": 90})]
 same = True; once = True
@@ -302,11 +316,11 @@ for nm, co, em, r_, i_ in samples:
     SENT.clear(); orig.send_results_email(nm, co, em, r_, i_); o = SENT[-1]
     SENT.clear(); cl.send_results_email(nm, co, em, r_, i_); new = SENT[-1]
     once &= o["html"].count(PHRASE) == 1
-    same &= new == {**o, "html": o["html"].replace(PHRASE, "Free.")}
+    same &= new == {**o, "html": expected_results_html(o["html"])}
     SENT.clear(); orig.send_otp_email(nm, em, "123456"); o = SENT[-1]
     SENT.clear(); cl.send_otp_email(nm, em, "123456"); same &= (SENT[-1] == o)
 check(once, "the original results mail contains the phrase exactly once")
-check(same, "results mail == original with only that phrase removed; OTP mail == original, byte for byte, for ordinary samples")
+check(same, "results mail == original with only the listed edits; OTP mail == original, byte for byte, for ordinary samples")
 
 print("-- 12. no e-mail address, name or company in any log line")
 lines = []
