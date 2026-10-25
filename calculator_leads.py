@@ -381,7 +381,7 @@ def send_results_email(name: str, company: str, email: str,
   </tr></table>
   <div class="gap-box">
     Your true cost per lead is <b>{gap_abs:.0f}% {gap_dir}</b> than your dashboard reports — a gap of <b>{_fmt(cpl_diff)} per lead</b>, or <b>{_fmt_r(hidden_costs)}/month</b> on this campaign alone.<br><br>
-    This was one campaign, entered manually. CDAI tracks this automatically across every campaign, every morning — connected live to your ad accounts and CRM, with no manual entry.
+    This was one campaign, entered manually. CDAI tracks this automatically across every campaign, every night — connected live to your ad accounts and CRM, with no manual entry.
   </div>
   <hr>
   <span class="sec-title">What to do next</span>
@@ -394,7 +394,7 @@ def send_results_email(name: str, company: str, email: str,
   <div class="option">
     <span class="opt-lbl">Option 02 — Full Access</span>
     <span class="opt-title">CDAI Retainer — from $497/month</span>
-    <p class="opt-desc">CDAI connects to your ad accounts, CRM, and lead distribution stack. One directive per campaign, every morning — Scale, Hold, Cut, Pause, Quarantine, Renegotiate, Investigate, or Flag — based on your true margin after every cost layer. Automated, continuous, no spreadsheets. Plans start at $497/month for up to $10K/month in ad spend. Sign up and pay online.</p>
+    <p class="opt-desc">CDAI connects your HubSpot or Salesforce to your ad accounts and gives one call per campaign, every night — Scale, Hold, Cut, Pause, Quarantine, Renegotiate, Investigate, or Flag — based on its true profit after every recorded cost. Automated, continuous, no spreadsheets. Plans start at $497/month for up to $10K/month in ad spend. Sign up and pay online.</p>
     <a class="btn-gold" href="https://cdai-portal.vercel.app/signup/">Get Started &rarr;</a>
   </div>
   <div class="newsletter">

@@ -298,7 +298,11 @@ PHRASE = "Every two weeks, free."   # edit 1 (Oct 14): becomes "Free."
 # Edit 2 (Oct 25 2026, test_results_email_cta.py): the retainer option names the $497/month Entry plan and its button goes to signup instead of #intake.
 OPT2 = [('<span class="opt-title">CDAI Retainer</span>', '<span class="opt-title">CDAI Retainer — from $497/month</span>'),
         ('Automated, continuous, no spreadsheets.</p>', 'Automated, continuous, no spreadsheets. Plans start at $497/month for up to $10K/month in ad spend. Sign up and pay online.</p>'),
-        ('<a class="btn-gold" href="https://alloceraintelligence.com/#intake">Learn More &rarr;</a>', '<a class="btn-gold" href="https://cdai-portal.vercel.app/signup/">Get Started &rarr;</a>')]
+        ('<a class="btn-gold" href="https://alloceraintelligence.com/#intake">Learn More &rarr;</a>', '<a class="btn-gold" href="https://cdai-portal.vercel.app/signup/">Get Started &rarr;</a>'),
+        # Edit 3 (Oct 25 2026, independent review): the engine runs nightly, and who qualifies is HubSpot or Salesforce plus ads.
+        ('every campaign, every morning', 'every campaign, every night'),
+        ('CDAI connects to your ad accounts, CRM, and lead distribution stack. One directive per campaign, every morning', 'CDAI connects your HubSpot or Salesforce to your ad accounts and gives one call per campaign, every night'),
+        ('based on your true margin after every cost layer.', 'based on its true profit after every recorded cost.')]
 def expected_results_html(h):
     h = h.replace(PHRASE, "Free.")
     for a, b in OPT2:

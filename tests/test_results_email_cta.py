@@ -40,6 +40,8 @@ low = html.lower()
 check(not re.search(r"\b(7|seven)\s+(hidden\s+)?cost layers", low), "no '7 cost layers'")
 check(not re.search(r"\d+(\.\d+)?\s?%\s+accura|accura\w*\s+\d", low), "no accuracy percentage")
 check("100% credit" not in low and "credit 100%" not in low, "no '100% credit'")
+check("every morning" not in low and "every night" in opt2.lower(), "the email says 'every night' (the engine runs nightly at 02:00 UTC, scheduler.py via Render cron cdai-engine), never 'every morning'")
+check("hubspot or salesforce" in opt2.lower() and "cost layer" not in opt2.lower(), "Option 02 names HubSpot or Salesforce (who qualifies) and no 'cost layer' wording")
 check(SENT and SENT[0]["subject"].startswith("Your distortion audit"), "the subject line is unchanged")
 
 print("ALL PASS" if not fails else f"FAILED {len(fails)}"); sys.exit(1 if fails else 0)
